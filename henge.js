@@ -14,7 +14,7 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '0.0.1';
+    const VERSION = '0.1.0';
 
     const LS_ENABLED = 'henge:enabled';
     const ROOT_CLASS = 'henge-on';
@@ -31,9 +31,52 @@
 
     // ── Layout CSS ────────────────────────────────────────────────────────────
     // Every rule is scoped under html.henge-on, so removing that one class
-    // restores Spotify's native layout. Empty until Phase 1.
+    // restores Spotify's native layout.
+    //
+    // Grid items (from Henge.recon() on 1.3.3): #Desktop_LeftSidebar_Id,
+    // #main-view, the right panel (the child holding #Desktop_PanelContainer_Id),
+    // the now-playing bar, #global-nav-bar, plus overlays that span named lines.
 
-    const CSS = ``;
+    const RIGHT = '.Root__top-container > :has(#Desktop_PanelContainer_Id)';
+
+    const CSS = `
+html.henge-on .Root__top-container {
+    grid-template:
+        "top-banner top-banner"
+        "global-nav global-nav"
+        "main-view main-view" minmax(0, 1fr)
+        "left-sidebar right-sidebar" var(--henge-bottom-h, 40%)
+        "now-playing-bar now-playing-bar"
+        / auto minmax(0, 1fr) !important;
+}
+
+/* Right panel fills whatever the library leaves. */
+html.henge-on ${RIGHT} {
+    width: auto !important;
+    min-width: 0 !important;
+}
+html.henge-on #Desktop_PanelContainer_Id {
+    width: 100% !important;
+}
+
+/* The library's own resizer now sits on the library/right-panel boundary and
+   does the job; the right panel's resizer would fight it. */
+html.henge-on ${RIGHT} > .LayoutResizer__resize-bar {
+    display: none !important;
+}
+
+/* Right panel closed: the library takes the whole bottom row. */
+html.henge-on .Root__top-container:not(:has(#Desktop_PanelContainer_Id)) > #Desktop_LeftSidebar_Id {
+    grid-column: 1 / -1 !important;
+    width: auto !important;
+}
+
+/* Lyrics cinema natively spans from the library's right edge to the window's.
+   Stacked, that becomes the whole area above the bottom row. */
+html.henge-on .Root__lyrics-cinema {
+    grid-area: 1 / 1 / left-sidebar-start / -1 !important;
+}
+`;
 
     // ── State ─────────────────────────────────────────────────────────────────
 
@@ -75,14 +118,17 @@
 
     function checkLayout() {
         const vw = window.innerWidth, vh = window.innerHeight;
+        // [element, min width, min height]. The library can legitimately
+        // collapse to an icon strip, hence its low minimum width.
         const targets = {
-            'main view': document.querySelector('.main-view-container'),
-            'now-playing bar': document.querySelector('.main-nowPlayingBar-nowPlayingBar'),
+            'main view': [document.getElementById('main-view'), 200, 150],
+            'library': [document.getElementById('Desktop_LeftSidebar_Id'), 40, 80],
+            'now-playing bar': [document.querySelector('.main-nowPlayingBar-nowPlayingBar'), 200, 40],
         };
-        for (const [name, el] of Object.entries(targets)) {
+        for (const [name, [el, minW, minH]] of Object.entries(targets)) {
             if (!el) continue; // not rendered (yet) — nothing to judge
             const r = el.getBoundingClientRect();
-            if (r.width < 100 || r.height < 40) return `${name} is too small`;
+            if (r.width < minW || r.height < minH) return `${name} is too small`;
             if (r.right > vw + 2 || r.bottom > vh + 2 || r.left < -2 || r.top < -2) {
                 return `${name} is off screen`;
             }
