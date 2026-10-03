@@ -15,7 +15,7 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '0.2.0';
+    const VERSION = '0.2.1';
 
     const LS_ENABLED = 'henge:enabled';
     const LS_BOTTOM  = 'henge:bottomHeight';   // px, bottom row height
@@ -93,18 +93,16 @@ html.henge-on:not(.henge-lib-collapsed) ${NO_RIGHT} > #${LEFT_ID} {
     width: auto !important;
 }
 
-/* Expanded library: natively it takes over the main view, so stacked it
-   takes the main-view area and the right panel gets the whole bottom row. */
+/* Expanded library: natively it takes over the main view. Stacked, it takes
+   over the right panel's space instead (the whole bottom row) and leaves the
+   main view alone. The panel is hidden, not unmounted, so it comes back as it
+   was. */
 html.henge-on.henge-lib-expanded #${LEFT_ID} {
-    grid-area: main-view !important;
+    grid-area: left-sidebar / 1 / left-sidebar / -1 !important;
     width: auto !important;
 }
 html.henge-on.henge-lib-expanded ${RIGHT} {
-    grid-column: 1 / -1 !important;
-}
-/* Expanded with the right panel closed: the library takes both rows. */
-html.henge-on.henge-lib-expanded ${NO_RIGHT} > #${LEFT_ID} {
-    grid-area: main-view-start / 1 / left-sidebar-end / -1 !important;
+    visibility: hidden !important;
 }
 /* The expanded-mode placeholder would hold an empty column open. Taken out of
    flow rather than display:none, because updateState() reads its display. */
@@ -120,13 +118,17 @@ html.henge-on ${RIGHT} {
     width: auto !important;
     min-width: 0 !important;
 }
-html.henge-on ${RIGHT} > :not(.LayoutResizer__resize-bar) {
+/* Four wrappers sit between the grid item and the <aside>; one carries an
+   inline width from React (the panel's native size) and the rest shrink to
+   it. Stretch every element on that chain, whatever its hashed class. */
+html.henge-on ${RIGHT} :has(#Desktop_PanelContainer_Id) {
     flex: 1 1 auto !important;
-    width: auto !important;
+    width: 100% !important;
     min-width: 0 !important;
     max-width: none !important;
 }
 html.henge-on #Desktop_PanelContainer_Id {
+    flex: 1 1 auto !important;
     width: 100% !important;
     max-width: none !important;
 }
@@ -204,8 +206,7 @@ html.henge-on #henge-col-handle::after {
 /* No library/right-panel boundary to drag in these states. */
 html.henge-on.henge-lib-collapsed #henge-col-handle,
 html.henge-on.henge-lib-expanded #henge-col-handle,
-html.henge-on ${NO_RIGHT} > #henge-col-handle,
-html.henge-on.henge-lib-expanded ${NO_RIGHT} > #henge-row-handle {
+html.henge-on ${NO_RIGHT} > #henge-col-handle {
     display: none;
 }
 
