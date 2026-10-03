@@ -15,7 +15,7 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '0.2.1';
+    const VERSION = '0.2.2';
 
     const LS_ENABLED = 'henge:enabled';
     const LS_BOTTOM  = 'henge:bottomHeight';   // px, bottom row height
@@ -438,12 +438,17 @@ html.henge-on.henge-resizing .henge-handle {
         if (left) observer.observe(left, { attributes: true, attributeFilter: ['class', 'style'] });
         const placeholder = left?.previousElementSibling;
         if (placeholder) observer.observe(placeholder, { attributes: true, attributeFilter: ['class', 'style'] });
+        // Expand / minimise are animated: Spotify keeps the placeholder visible
+        // while <html> carries data-transition / data-cinema-library-* attributes,
+        // so the state must be re-read once those change.
+        observer.observe(html, { attributes: true });
         hooked = { root, left };
         applySizes();
         schedule();
     }
 
-    setInterval(() => { if (isOn()) hook(); }, 1000);
+    // Also a safety net for any state change the observers miss.
+    setInterval(() => { if (isOn()) { hook(); schedule(); } }, 1000);
 
     let resizePending = false;
     window.addEventListener('resize', () => {
