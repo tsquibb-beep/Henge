@@ -1,0 +1,18 @@
+# Local working notes (public repo: these carry local paths)
+CLAUDE.md
+HANDOVER.md
+
+# Local backups of the Spicetify config
+.backup/
+
+# Env / secrets
+.env
+.env.*
+
+# Editor
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
