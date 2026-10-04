@@ -26,13 +26,15 @@ panels (top, bottom left, bottom right), each with a dropdown:
 - **Main view:** the page you're browsing. It always has to be somewhere.
 - **Library**
 - **Side panel:** Spotify's Now Playing, Queue or Friend Activity, whichever is open.
-- **Pinned panels:** Now Playing, Queue or Friend Activity, each shown on its own. These
-  are live copies of Spotify's own panels, with the same menus, drag and drop and
-  updates, so you can have Now Playing and the Queue side by side.
+- **Pinned panels:** Now Playing, Queue, Friend Activity or Lyrics, each shown on its
+  own. These are live copies of Spotify's own panels, with the same menus, drag and drop
+  and updates, so you can have Now Playing and the Queue side by side, or lyrics
+  alongside a playlist.
 - **Nothing:** the neighbouring panel takes the space.
 
 The first time a pinned panel is shown in a session, Henge opens it in Spotify's side
-panel for a moment to borrow it, then puts the side panel back as it was.
+panel (or, for Lyrics, the main view) for a moment to borrow it, then puts things back
+as they were.
 
 Picking something that's already in another panel swaps the two. Your layout is
 remembered between restarts. If a choice would leave the main view or the now-playing

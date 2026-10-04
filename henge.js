@@ -15,7 +15,7 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '0.4.0';
+    const VERSION = '0.5.0';
 
     const LS_ENABLED = 'henge:enabled';
     const LS_LAYOUT  = 'henge:layout';         // JSON {top, left, right}
@@ -80,6 +80,9 @@
         nowplaying: { label: 'Now Playing',     group: 'Pinned panels', sel: view('nowplaying'), child: view('nowplaying'), pinned: true, control: 'Now Playing' },
         queue:      { label: 'Queue',           group: 'Pinned panels', sel: view('queue'),      child: view('queue'),      pinned: true, control: 'Queue' },
         friends:    { label: 'Friend Activity', group: 'Pinned panels', sel: view('friends'),    child: view('friends'),    pinned: true, control: 'Friend Activity' },
+        // Spotify's lyrics are a main-view page, not a side panel: captured
+        // from the main view instead (see openAndCaptureMain).
+        lyrics:     { label: 'Lyrics',          group: 'Pinned panels', sel: view('lyrics'),     child: view('lyrics'),     pinned: true, from: 'main', route: '/lyrics' },
         none:       { label: 'Nothing',         group: null },
     };
 
@@ -225,6 +228,11 @@ html.henge-on .henge-view-content {
     width: 100% !important;
     height: auto !important;
     min-height: 0;
+}
+/* A main-view page (lyrics) normally scrolls in the main view's scroll node;
+   in its own slot it scrolls here. */
+html.henge-on #henge-view-lyrics .henge-view-content {
+    overflow-y: auto;
 }
 .henge-view-msg {
     display: flex;
@@ -863,9 +871,51 @@ html.henge-on.henge-resizing .henge-handle {
         return null;
     }
 
+    // ── Capturing a main-view page (lyrics) ──
+    // Proven by Henge.spike(11, 'main') on 2026-10-04: the component directly
+    // under the page wrapper (the fibre with a `pageId` prop) takes no props,
+    // follows the playing track, highlights, scrolls and seeks on its own.
+
+    const spotifyHistory = () => Spicetify.Platform?.History;
+    const onRoute = route => spotifyHistory()?.location?.pathname === route;
+
+    // The page's own component: first component under the page wrapper.
+    function mainPageComponent() {
+        const fiber = fiberOf(document.getElementById('main-view'));
+        if (!fiber) return null;
+        const top = currentPath(fiber)?.[0] ?? fiber;
+        const page = componentsUnder(top, 200, 60).find(c => 'pageId' in (c.fiber.memoizedProps ?? {}));
+        return page ? componentsUnder(page.fiber, 1)[0]?.fiber ?? null : null;
+    }
+
+    // Show the page in the main view (if it isn't already), capture it, go
+    // back to where the main view was.
+    async function openAndCaptureMain(kind) {
+        const { route, label } = SOURCES[kind];
+        const H = spotifyHistory();
+        if (!H) throw new Error("Spotify's navigation isn't available");
+        const navigated = !onRoute(route);
+        if (navigated) H.push(route);
+        try {
+            const found = await waitFor(() => onRoute(route) && mainPageComponent(), 4000);
+            if (!found) throw new Error(`the ${label} page didn't open`);
+            await sleep(300); // let the page settle
+            const page = mainPageComponent() ?? found;
+            captured[kind] = {
+                element: Spicetify.React.createElement(page.elementType ?? page.type, { ...page.memoizedProps }),
+                providers: providersAbove(page.return),
+                asideClass: '',
+                label,
+            };
+        } finally {
+            if (navigated && onRoute(route)) (H.goBack ?? H.back)?.call(H);
+        }
+    }
+
     // Open `kind` in the real side panel (if needed), capture it, put the
     // side panel back the way it was.
     async function openAndCapture(kind) {
+        if (SOURCES[kind].from === 'main') return openAndCaptureMain(kind);
         const control = SOURCES[kind].control;
         const before = settledAside();
         const wasOpen = !!document.getElementById(ASIDE_ID);
