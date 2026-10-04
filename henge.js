@@ -15,7 +15,7 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '0.3.0';
+    const VERSION = '0.3.1';
 
     const LS_ENABLED = 'henge:enabled';
     const LS_LAYOUT  = 'henge:layout';         // JSON {top, left, right}
@@ -615,13 +615,14 @@ html.henge-on.henge-resizing .henge-handle {
 
     // ── Side panel placeholder ────────────────────────────────────────────────
     // Shown in the top slot when the side panel is assigned there but closed.
-    // Its buttons click Spotify's own controls (selectors to be confirmed by
-    // Henge.probe(); aria-labels are the fallback).
+    // Its buttons click Spotify's own controls. Selectors confirmed by
+    // Henge.probe() on 1.3.3: the NPV button has no test id, and Friend
+    // Activity is labelled "Listening activity" in the global nav.
 
     const PANEL_CONTROLS = {
         'Now Playing': ['[data-testid="control-button-npv"]', 'button[aria-label="Now playing view"]'],
         'Queue': ['[data-testid="control-button-queue"]', 'button[aria-label="Queue"]'],
-        'Friend Activity': ['[data-testid="friend-activity-button"]', 'button[aria-label="Friend Activity"]'],
+        'Friend Activity': ['button[aria-label="Listening activity"]', 'button[aria-label="Friend Activity"]'],
     };
 
     function clickControl(name) {
@@ -1090,7 +1091,173 @@ html.henge-on.henge-resizing .henge-handle {
         return copyOut('probe', out);
     }
 
-    window.Henge = { version: VERSION, enable, disable, toggle, recon, probe, get layout() { return { ...layout }; } };
+    // ── Spike: a second live copy of Spotify's side panel ─────────────────────
+    // Experiment (2026-10-04): can Spotify's own panel components run twice?
+    // Henge.spike() takes whatever the side panel shows right now — its React
+    // component, props, and every context provider above it — and renders a
+    // second copy in a floating box. Then switch the real side panel to
+    // something else and see whether the copy stays alive and interactive.
+    //   Henge.spike()        render candidate 0 (the outermost panel component)
+    //   Henge.spike(n)       render candidate n from the report instead
+    //   Henge.spikeClose()   close every spike box
+
+    const COMPOSITE_TAGS = new Set([0, 1, 11, 14, 15]); // function, class, forwardRef, memo, simple memo
+    const PROVIDER_TAG = 10;
+
+    function fiberOf(el) {
+        const key = el && Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+        return key ? el[key] : null;
+    }
+
+    function fiberName(f) {
+        const t = f.elementType ?? f.type;
+        return t?.displayName || t?.name || t?.render?.displayName || t?.render?.name
+            || t?.type?.displayName || t?.type?.name || `(anonymous, tag ${f.tag})`;
+    }
+
+    // Composite (component) fibers under the aside, depth-first, outermost first.
+    function panelCandidates(asideFiber, limit = 12) {
+        const out = [];
+        const stack = [[asideFiber.child, 0]];
+        while (stack.length && out.length < limit) {
+            const [f, depth] = stack.pop();
+            if (!f) continue;
+            if (COMPOSITE_TAGS.has(f.tag)) out.push({ fiber: f, depth });
+            if (f.sibling) stack.push([f.sibling, depth]);
+            if (f.child && depth < 8) stack.push([f.child, depth + 1]);
+        }
+        return out;
+    }
+
+    // Context providers from a fibre up to the root, innermost first. The
+    // provider's fibre type renders as the provider in React 18 and 19 alike.
+    function providersAbove(fiber) {
+        const list = [];
+        for (let f = fiber; f; f = f.return) {
+            if (f.tag === PROVIDER_TAG) list.push({ type: f.type, value: f.memoizedProps?.value });
+        }
+        return list;
+    }
+
+    // Spicetify.ReactDOM is the module with createPortal; createRoot may live
+    // in react-dom/client. Look in webpack's cache of already-loaded modules
+    // only, so nothing new gets executed.
+    function findCreateRoot() {
+        if (typeof Spicetify.ReactDOM?.createRoot === 'function') return Spicetify.ReactDOM.createRoot;
+        let req = null;
+        try { window.webpackChunkclient_web.push([[Symbol('henge')], {}, r => { req = r; }]); } catch {}
+        for (const mod of Object.values(req?.c ?? {})) {
+            const ex = mod?.exports;
+            if (ex && typeof ex.createRoot === 'function' && typeof ex.hydrateRoot === 'function') return ex.createRoot;
+        }
+        return null;
+    }
+
+    function spikeBoundary() {
+        const R = Spicetify.React;
+        return class HengeSpikeBoundary extends R.Component {
+            constructor(props) { super(props); this.state = { error: null }; }
+            static getDerivedStateFromError(error) { return { error }; }
+            componentDidCatch(error) { warn('spike render error:', error); }
+            render() {
+                if (!this.state.error) return this.props.children;
+                return R.createElement('pre', {
+                    style: { margin: 0, padding: 12, whiteSpace: 'pre-wrap', fontSize: 12, color: 'var(--text-subdued, #b3b3b3)' },
+                }, String(this.state.error?.stack || this.state.error));
+            }
+        };
+    }
+
+    const spikes = [];
+
+    function spikeBox(title, asideClass) {
+        const n = spikes.length;
+        const box = document.createElement('div');
+        Object.assign(box.style, {
+            position: 'fixed', top: `${80 + n * 30}px`, right: `${20 + n * 30}px`,
+            width: '420px', height: '65vh', zIndex: 9998, display: 'flex', flexDirection: 'column',
+            borderRadius: '8px', overflow: 'hidden', resize: 'both',
+            background: 'var(--background-base, #121212)', boxShadow: '0 16px 24px rgba(0,0,0,.5)',
+            outline: '2px dashed var(--essential-subdued, #727272)',
+        });
+        const bar = document.createElement('div');
+        Object.assign(bar.style, {
+            display: 'flex', justifyContent: 'space-between', alignItems: 'center', flex: '0 0 auto',
+            padding: '6px 10px', fontSize: '12px', color: 'var(--text-subdued, #b3b3b3)',
+            background: 'var(--background-elevated-base, #282828)',
+        });
+        bar.append(`Henge spike — ${title}`);
+        const close = document.createElement('button');
+        close.textContent = '×';
+        Object.assign(close.style, { background: 'none', border: 0, color: 'inherit', fontSize: '18px', cursor: 'pointer' });
+        bar.append(close);
+        const content = document.createElement('div');
+        content.className = asideClass; // Spotify's own panel container styling
+        Object.assign(content.style, { flex: '1 1 auto', minHeight: 0, height: 'auto', position: 'relative' });
+        box.append(bar, content);
+        document.body.append(box);
+        return { box, content, close };
+    }
+
+    function spike(index = 0) {
+        const R = Spicetify.React;
+        const report = { henge: VERSION, react: R?.version ?? null };
+        const done = () => copyOut('spike', report);
+
+        const aside = document.getElementById('Desktop_PanelContainer_Id');
+        if (!aside) { report.error = 'Open the side panel first (Queue or Now Playing).'; return done(); }
+        const asideFiber = fiberOf(aside);
+        if (!asideFiber) { report.error = 'No React fibre on the side panel element.'; return done(); }
+
+        const candidates = panelCandidates(asideFiber);
+        report.candidates = candidates.map((c, i) => ({
+            i, depth: c.depth, tag: c.fiber.tag, name: fiberName(c.fiber),
+            props: Object.keys(c.fiber.memoizedProps ?? {}),
+        }));
+        const pick = candidates[index];
+        if (!pick) { report.error = `No candidate ${index}.`; return done(); }
+
+        const createRoot = findCreateRoot();
+        report.createRoot = !!createRoot;
+        if (!createRoot) { report.error = 'Could not find ReactDOM createRoot.'; return done(); }
+
+        const providers = providersAbove(pick.fiber.return);
+        report.providers = providers.length;
+
+        let el = R.createElement(pick.fiber.elementType ?? pick.fiber.type, { ...pick.fiber.memoizedProps });
+        for (const p of providers) el = R.createElement(p.type, { value: p.value }, el);
+
+        const name = fiberName(pick.fiber);
+        const { box, content, close } = spikeBox(`#${index} ${name}`, aside.className);
+        try {
+            const root = createRoot(content);
+            root.render(R.createElement(spikeBoundary(), null, el));
+            const entry = { box, root };
+            close.addEventListener('click', () => {
+                try { root.unmount(); } catch {}
+                box.remove();
+                spikes.splice(spikes.indexOf(entry), 1);
+            });
+            spikes.push(entry);
+            report.rendered = { index, name };
+        } catch (e) {
+            report.error = `render threw: ${e?.message ?? e}`;
+            box.remove();
+        }
+        return done();
+    }
+
+    function spikeClose() {
+        for (const { box, root } of spikes.splice(0)) {
+            try { root.unmount(); } catch {}
+            box.remove();
+        }
+    }
+
+    window.Henge = {
+        version: VERSION, enable, disable, toggle, recon, probe, spike, spikeClose,
+        get layout() { return { ...layout }; },
+    };
 
     // ── Start ─────────────────────────────────────────────────────────────────
 
