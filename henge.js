@@ -15,7 +15,7 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '0.5.4';
+    const VERSION = '0.5.5';
 
     const LS_ENABLED = 'henge:enabled';
     const LS_LAYOUT  = 'henge:layout';         // JSON {top, left, right}
@@ -221,13 +221,15 @@ html.henge-on .henge-view {
     background-color: var(--background-base, #121212);
 }
 /* Carries the captured <aside>'s own classes, so Spotify styles the copy
-   exactly like the original panel. */
+   exactly like the original panel. Pinned to the view's box so its size is
+   definite: Spotify's panels size their scroll areas with height: 100%,
+   which a flex-sized box didn't resolve, so Now Playing's scroll area grew
+   past the view and its end was clipped (field feedback 2026-10-04). */
 html.henge-on .henge-view-content {
-    flex: 1 1 auto;
-    position: relative;
-    width: 100% !important;
+    position: absolute !important;
+    inset: 0;
+    width: auto !important;
     height: auto !important;
-    min-height: 0;
 }
 /* A main-view page (lyrics) normally scrolls in the main view's scroll node;
    in its own slot it scrolls here. */
@@ -1543,6 +1545,29 @@ html.henge-on.henge-resizing .henge-handle {
         };
     }
 
+    // Elements inside a pinned panel that scroll, or are taller than the
+    // panel: where its height goes, for diagnosing clipped scrolling.
+    function scrollersIn(root) {
+        const limit = root.getBoundingClientRect().height + 2;
+        const out = [];
+        for (const el of root.querySelectorAll('*')) {
+            const cs = getComputedStyle(el);
+            const scrolls = /auto|scroll/.test(cs.overflowY) && el.scrollHeight > el.clientHeight + 1;
+            const tall = el.getBoundingClientRect().height > limit;
+            if (!scrolls && !tall) continue;
+            out.push({
+                className: (typeof el.className === 'string' ? el.className : '').slice(0, 60),
+                overflowY: cs.overflowY,
+                height: cs.height,
+                clientHeight: el.clientHeight,
+                scrollHeight: el.scrollHeight,
+                tall,
+            });
+            if (out.length >= 8) break;
+        }
+        return out;
+    }
+
     // Henge.recon(): the root grid and its children, so the layout can be
     // written against the real DOM. Copies JSON to the clipboard.
     function recon() {
@@ -1578,6 +1603,8 @@ html.henge-on.henge-resizing .henge-handle {
                 ownScrollNode: !!captured[kind]?.ownScrollNode,
                 scrollContextFound: !!v.scrollCtx,
                 lastChanged: v.lastChanged ?? [],
+                viewHeight: Math.round(v.el.getBoundingClientRect().height),
+                scrollers: scrollersIn(v.el),
             }])),
         });
     }
