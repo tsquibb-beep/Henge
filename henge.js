@@ -15,7 +15,7 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '0.5.0';
+    const VERSION = '0.5.1';
 
     const LS_ENABLED = 'henge:enabled';
     const LS_LAYOUT  = 'henge:layout';         // JSON {top, left, right}
@@ -901,11 +901,14 @@ html.henge-on.henge-resizing .henge-handle {
             if (!found) throw new Error(`the ${label} page didn't open`);
             await sleep(300); // let the page settle
             const page = mainPageComponent() ?? found;
+            const providers = providersAbove(page.return);
             captured[kind] = {
                 element: Spicetify.React.createElement(page.elementType ?? page.type, { ...page.memoizedProps }),
-                providers: providersAbove(page.return),
+                providers,
                 asideClass: '',
                 label,
+                freezeRoute: true, // see freshValues
+                routeProviders: providers.filter(p => isRouteValue(p.value)).length, // for Henge.recon()
             };
         } finally {
             if (navigated && onRoute(route)) (H.goBack ?? H.back)?.call(H);
@@ -976,6 +979,14 @@ html.henge-on.henge-resizing .henge-handle {
     }
 
     // Context values for a capture: app-wide providers re-read live.
+    //
+    // A main-view page (lyrics) also keeps the router's values it was captured
+    // with: with the live location it believes it's off screen and stops
+    // auto-scrolling (field-tested 2026-10-04: highlighting kept working, the
+    // scroll didn't).
+    const isRouteValue = v => !!v && typeof v === 'object'
+        && (typeof v.location?.pathname === 'string' || typeof v.pathname === 'string' || Array.isArray(v.matches));
+
     function freshValues(cap) {
         const live = new Map();
         for (const f of currentPath(fiberOf(document.getElementById('main-view'))) ?? []) {
@@ -983,8 +994,15 @@ html.henge-on.henge-resizing .henge-handle {
             live.set(f, f.memoizedProps?.value);
             if (f.alternate) live.set(f.alternate, f.memoizedProps?.value);
         }
-        return cap.providers.map(p => (live.has(p.fiber) ? live.get(p.fiber) : p.value));
+        return cap.providers.map(p => {
+            if (!live.has(p.fiber)) return p.value;
+            if (cap.freezeRoute && isRouteValue(p.value)) return p.value;
+            return live.get(p.fiber);
+        });
     }
+
+    // Short description of a context value, for Henge.recon().
+    const valueKeys = v => (v && typeof v === 'object' ? Object.keys(v).slice(0, 8).join(',') : typeof v);
 
     let ViewBoundary = null;
     function viewBoundary() {
@@ -1081,7 +1099,11 @@ html.henge-on.henge-resizing .henge-handle {
             const cap = captured[kind];
             if (!cap || !v.values) continue;
             const next = freshValues(cap);
-            if (next.some((val, i) => val !== v.values[i])) renderView(kind);
+            const changed = next.map((val, i) => (val !== v.values[i] ? i : -1)).filter(i => i >= 0);
+            if (!changed.length) continue;
+            // Kept for Henge.recon(): which context values keep changing.
+            v.lastChanged = changed.map(i => ({ i, keys: valueKeys(next[i]) }));
+            renderView(kind);
         }
     }
 
@@ -1467,6 +1489,13 @@ html.henge-on.henge-resizing .henge-handle {
                 gridTemplateRows: cs.gridTemplateRows,
             },
             children: [...root.children].map(describe),
+            pinned: Object.fromEntries([...views].map(([kind, v]) => [kind, {
+                captured: !!captured[kind],
+                error: v.error,
+                providers: captured[kind]?.providers.length ?? null,
+                frozenRouteProviders: captured[kind]?.routeProviders ?? null,
+                lastChanged: v.lastChanged ?? [],
+            }])),
         });
     }
 
