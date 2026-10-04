@@ -14,9 +14,23 @@ the right panel (Now Playing, Queue, Friend Activity) sit underneath it, side by
 ├──────────────── now-playing bar ───────────┤
 ```
 
-Drag the handles between panels to resize them.
+Drag the handles between panels to resize them. Double-click a handle to reset it.
 
-> **Status: early development (v0.0.x).** The layout itself is not in yet.
+> **Status: early development (v0.x).**
+
+## Choosing what each panel shows
+
+Click the **Henge layout** button in the top bar. It shows a small map of the three
+panels (top, bottom left, bottom right), each with a dropdown:
+
+- **Main view:** the page you're browsing. It always has to be somewhere.
+- **Library**
+- **Side panel:** Spotify's Now Playing, Queue or Friend Activity, whichever is open.
+- **Nothing:** the neighbouring panel takes the space.
+
+Picking something that's already in another panel swaps the two. Your layout is
+remembered between restarts. If a choice would leave the main view or the now-playing
+bar squashed or off screen, Henge puts the previous layout back.
 
 ## Install
 
