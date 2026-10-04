@@ -15,7 +15,7 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '0.5.2';
+    const VERSION = '0.5.3';
 
     const LS_ENABLED = 'henge:enabled';
     const LS_LAYOUT  = 'henge:layout';         // JSON {top, left, right}
@@ -907,7 +907,7 @@ html.henge-on.henge-resizing .henge-handle {
                 providers,
                 asideClass: '',
                 label,
-                frozen: true, // see freshValues
+                ownScrollNode: true, // see scrollNodeFor
             };
         } finally {
             if (navigated && onRoute(route)) (H.goBack ?? H.back)?.call(H);
@@ -978,15 +978,7 @@ html.henge-on.henge-resizing .henge-handle {
     }
 
     // Context values for a capture: app-wide providers re-read live.
-    //
-    // A main-view page (lyrics) is `frozen`: it keeps every value it was
-    // captured with, as in the spike that proved it. With live values it
-    // believes it's off screen once the main view moves on, and stops
-    // auto-scrolling (field-tested 2026-10-04: highlighting and seeking kept
-    // working, the scroll didn't; freezing only router-shaped values in 0.5.1
-    // wasn't enough).
     function freshValues(cap) {
-        if (cap.frozen) return cap.providers.map(p => p.value);
         const live = new Map();
         for (const f of currentPath(fiberOf(document.getElementById('main-view'))) ?? []) {
             if (f.tag !== PROVIDER_TAG) continue;
@@ -994,6 +986,30 @@ html.henge-on.henge-resizing .henge-handle {
             if (f.alternate) live.set(f.alternate, f.memoizedProps?.value);
         }
         return cap.providers.map(p => (live.has(p.fiber) ? live.get(p.fiber) : p.value));
+    }
+
+    // A main-view page measures itself against Spotify's ScrollNodeContext
+    // ({ scrollNodeRef, scrollNodeChildRef, afterTheScrollNodeRef,
+    // beforeTheScrollNodeRef }), i.e. the main view's scroll area. Lyrics only
+    // auto-scroll while the current line sits in a "comfort zone" of that
+    // node's rect (xpui-modules.js, the lyrics line component), so a copy
+    // placed anywhere but over the main view never scrolls. Point the copy at
+    // its own scroll area instead. The object is cached per source value so
+    // React sees a stable context while nothing changes.
+    function scrollNodeFor(cap, v, value) {
+        if (!cap.ownScrollNode || !value || typeof value !== 'object' || !('scrollNodeRef' in value)) return value;
+        if (v.scrollCtx?.src !== value) {
+            const content = v.content;
+            v.scrollCtx = {
+                src: value,
+                ctx: {
+                    ...value,
+                    scrollNodeRef: { current: content },
+                    scrollNodeChildRef: { get current() { return content.firstElementChild; } },
+                },
+            };
+        }
+        return v.scrollCtx.ctx;
     }
 
     // Short description of a context value, for Henge.recon().
@@ -1045,7 +1061,9 @@ html.henge-on.henge-resizing .henge-handle {
         v.content.className = `henge-view-content ${cap.asideClass}`;
         v.values = freshValues(cap);
         let el = cap.element;
-        cap.providers.forEach((p, i) => { el = R.createElement(p.type, { value: v.values[i] }, el); });
+        cap.providers.forEach((p, i) => {
+            el = R.createElement(p.type, { value: scrollNodeFor(cap, v, v.values[i]) }, el);
+        });
         v.root.render(R.createElement(viewBoundary(), { key: v.attempt, label, onRetry: () => loadView(kind, true) }, el));
     }
 
@@ -1507,7 +1525,8 @@ html.henge-on.henge-resizing .henge-handle {
                 captured: !!captured[kind],
                 error: v.error,
                 providers: captured[kind]?.providers.length ?? null,
-                frozen: !!captured[kind]?.frozen,
+                ownScrollNode: !!captured[kind]?.ownScrollNode,
+                scrollContextFound: !!v.scrollCtx,
                 lastChanged: v.lastChanged ?? [],
             }])),
         });
