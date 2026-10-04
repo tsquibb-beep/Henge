@@ -15,7 +15,7 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '0.5.5';
+    const VERSION = '0.5.6';
 
     const LS_ENABLED = 'henge:enabled';
     const LS_LAYOUT  = 'henge:layout';         // JSON {top, left, right}
@@ -230,6 +230,15 @@ html.henge-on .henge-view-content {
     inset: 0;
     width: auto !important;
     height: auto !important;
+}
+/* Side-panel views size themselves against the panel slot Spotify wraps them
+   in (.Gl1s… { container: panel-slot/size }), e.g. Now Playing's height:
+   100cqh. Without a size container above it, cqh falls back to the window
+   height and the view runs off the bottom of its slot. */
+html.henge-on #henge-view-nowplaying > .henge-view-content,
+html.henge-on #henge-view-queue > .henge-view-content,
+html.henge-on #henge-view-friends > .henge-view-content {
+    container: panel-slot / size;
 }
 /* A main-view page (lyrics) normally scrolls in the main view's scroll node;
    in its own slot it scrolls here. */
