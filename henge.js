@@ -15,7 +15,7 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '0.5.1';
+    const VERSION = '0.5.2';
 
     const LS_ENABLED = 'henge:enabled';
     const LS_LAYOUT  = 'henge:layout';         // JSON {top, left, right}
@@ -907,8 +907,7 @@ html.henge-on.henge-resizing .henge-handle {
                 providers,
                 asideClass: '',
                 label,
-                freezeRoute: true, // see freshValues
-                routeProviders: providers.filter(p => isRouteValue(p.value)).length, // for Henge.recon()
+                frozen: true, // see freshValues
             };
         } finally {
             if (navigated && onRoute(route)) (H.goBack ?? H.back)?.call(H);
@@ -980,25 +979,21 @@ html.henge-on.henge-resizing .henge-handle {
 
     // Context values for a capture: app-wide providers re-read live.
     //
-    // A main-view page (lyrics) also keeps the router's values it was captured
-    // with: with the live location it believes it's off screen and stops
-    // auto-scrolling (field-tested 2026-10-04: highlighting kept working, the
-    // scroll didn't).
-    const isRouteValue = v => !!v && typeof v === 'object'
-        && (typeof v.location?.pathname === 'string' || typeof v.pathname === 'string' || Array.isArray(v.matches));
-
+    // A main-view page (lyrics) is `frozen`: it keeps every value it was
+    // captured with, as in the spike that proved it. With live values it
+    // believes it's off screen once the main view moves on, and stops
+    // auto-scrolling (field-tested 2026-10-04: highlighting and seeking kept
+    // working, the scroll didn't; freezing only router-shaped values in 0.5.1
+    // wasn't enough).
     function freshValues(cap) {
+        if (cap.frozen) return cap.providers.map(p => p.value);
         const live = new Map();
         for (const f of currentPath(fiberOf(document.getElementById('main-view'))) ?? []) {
             if (f.tag !== PROVIDER_TAG) continue;
             live.set(f, f.memoizedProps?.value);
             if (f.alternate) live.set(f.alternate, f.memoizedProps?.value);
         }
-        return cap.providers.map(p => {
-            if (!live.has(p.fiber)) return p.value;
-            if (cap.freezeRoute && isRouteValue(p.value)) return p.value;
-            return live.get(p.fiber);
-        });
+        return cap.providers.map(p => (live.has(p.fiber) ? live.get(p.fiber) : p.value));
     }
 
     // Short description of a context value, for Henge.recon().
@@ -1336,6 +1331,25 @@ html.henge-on.henge-resizing .henge-handle {
         });
         foot.append(hint, reset);
         picker.append(foot);
+
+        // Henge.recon() without DevTools: Spotify resets the DevTools flag in
+        // offline.bnk whenever it refreshes account data.
+        const diag = document.createElement('div');
+        diag.className = 'henge-picker-foot';
+        const copy = document.createElement('button');
+        copy.textContent = 'Copy diagnostics';
+        copy.addEventListener('click', () => {
+            try {
+                recon();
+                notify('Henge diagnostics copied to the clipboard');
+            } catch (e) {
+                notify(`Couldn't copy diagnostics: ${e.message}`, true);
+            }
+        });
+        const ver = document.createElement('span');
+        ver.textContent = `v${VERSION}`;
+        diag.append(copy, ver);
+        picker.append(diag);
     }
 
     function positionPicker() {
@@ -1493,7 +1507,7 @@ html.henge-on.henge-resizing .henge-handle {
                 captured: !!captured[kind],
                 error: v.error,
                 providers: captured[kind]?.providers.length ?? null,
-                frozenRouteProviders: captured[kind]?.routeProviders ?? null,
+                frozen: !!captured[kind]?.frozen,
                 lastChanged: v.lastChanged ?? [],
             }])),
         });
