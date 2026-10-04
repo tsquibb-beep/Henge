@@ -15,7 +15,7 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '0.5.3';
+    const VERSION = '0.5.4';
 
     const LS_ENABLED = 'henge:enabled';
     const LS_LAYOUT  = 'henge:layout';         // JSON {top, left, right}
@@ -233,6 +233,23 @@ html.henge-on .henge-view-content {
    in its own slot it scrolls here. */
 html.henge-on #henge-view-lyrics .henge-view-content {
     overflow-y: auto;
+}
+/* The lyrics "back to current line" button fades in and out on a CSS view
+   timeline that the current line publishes; #main-view declares its scope,
+   so the view has to as well. Name from Spotify's CSS (1.3.3). */
+html.henge-on #henge-view-lyrics {
+    timeline-scope: --scroll-to-viewport-button-anim;
+}
+/* Holds that button: centred, just above the bottom of the view. */
+html.henge-on .henge-view-after {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 0;
+    z-index: 1;
+    display: flex;
+    justify-content: center;
 }
 .henge-view-msg {
     display: flex;
@@ -1006,10 +1023,29 @@ html.henge-on.henge-resizing .henge-handle {
                     ...value,
                     scrollNodeRef: { current: content },
                     scrollNodeChildRef: { get current() { return content.firstElementChild; } },
+                    // Things Spotify portals around the scroll area (e.g. the
+                    // lyrics "back to current line" button) land in the view.
+                    beforeTheScrollNodeRef: { current: v.before },
+                    afterTheScrollNodeRef: { current: v.after },
                 },
             };
         }
         return v.scrollCtx.ctx;
+    }
+
+    // Spotify's lyrics pause auto-scroll while a scroll is "in progress": a
+    // scroll listener sets the flag and only a `scrollend` clears it (module
+    // 75160 and the lyrics line component). A scroll the browser makes on its
+    // own, e.g. clamping when the next song's lyrics are shorter, may never
+    // fire `scrollend`, leaving auto-scroll stuck off. Back-stop: once
+    // scrolling has been idle a moment, send one (what Spotify itself does in
+    // browsers without `onscrollend`).
+    function watchScrollEnd(el) {
+        let timer = null;
+        el.addEventListener('scroll', () => {
+            clearTimeout(timer);
+            timer = setTimeout(() => el.dispatchEvent(new Event('scrollend')), 450);
+        }, { passive: true });
     }
 
     // Short description of a context value, for Henge.recon().
@@ -1085,11 +1121,25 @@ html.henge-on.henge-resizing .henge-handle {
         el.className = 'henge-view';
         const content = document.createElement('div');
         content.className = 'henge-view-content';
-        el.append(content);
-        views.set(kind, { el, content, root: null, values: null, error: null, attempt: 0 });
+        // A main-view page scrolls in the view itself, with slots before and
+        // after the scroll area like the main view has (see scrollNodeFor).
+        const ownScroll = SOURCES[kind].from === 'main';
+        const before = ownScroll ? document.createElement('div') : null;
+        const after = ownScroll ? document.createElement('div') : null;
+        if (after) after.className = 'henge-view-after';
+        el.append(...[before, content, after].filter(Boolean));
+        if (ownScroll) watchScrollEnd(content);
+        views.set(kind, { el, content, before, after, root: null, values: null, error: null, attempt: 0 });
         getRoot()?.appendChild(el);
         loadView(kind);
     }
+
+    // A new song's lyrics start at the top, as they do in the main view.
+    Spicetify.Player?.addEventListener?.('songchange', () => {
+        for (const [kind, v] of views) {
+            if (SOURCES[kind].from === 'main') v.content.scrollTop = 0;
+        }
+    });
 
     function unmountView(kind) {
         const v = views.get(kind);
