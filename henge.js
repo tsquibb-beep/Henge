@@ -15,7 +15,7 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '0.3.1';
+    const VERSION = '0.4.0';
 
     const LS_ENABLED = 'henge:enabled';
     const LS_LAYOUT  = 'henge:layout';         // JSON {top, left, right}
@@ -70,11 +70,17 @@
 
     // `sel` matches the grid item; `child` is the same item as a selector that
     // can follow "NO_RIGHT >" (the side panel has none: it's the one missing).
+    // Pinned panels are live second copies of Spotify's own side-panel views
+    // (see "Pinned panels"); `control` is the Spotify button that opens one.
+    const view = kind => `#henge-view-${kind}`;
     const SOURCES = {
-        main:    { label: 'Main view',  group: 'Spotify', sel: '#main-view',  child: '#main-view' },
-        library: { label: 'Library',    group: 'Spotify', sel: `#${LEFT_ID}`, child: `#${LEFT_ID}` },
-        panel:   { label: 'Side panel', group: 'Spotify', sel: RIGHT,         child: null },
-        none:    { label: 'Nothing',    group: null },
+        main:       { label: 'Main view',       group: 'Spotify', sel: '#main-view',  child: '#main-view' },
+        library:    { label: 'Library',         group: 'Spotify', sel: `#${LEFT_ID}`, child: `#${LEFT_ID}` },
+        panel:      { label: 'Side panel',      group: 'Spotify', sel: RIGHT,         child: null },
+        nowplaying: { label: 'Now Playing',     group: 'Pinned panels', sel: view('nowplaying'), child: view('nowplaying'), pinned: true, control: 'Now Playing' },
+        queue:      { label: 'Queue',           group: 'Pinned panels', sel: view('queue'),      child: view('queue'),      pinned: true, control: 'Queue' },
+        friends:    { label: 'Friend Activity', group: 'Pinned panels', sel: view('friends'),    child: view('friends'),    pinned: true, control: 'Friend Activity' },
+        none:       { label: 'Nothing',         group: null },
     };
 
     const DEFAULT_LAYOUT = { top: 'main', left: 'library', right: 'panel' };
@@ -199,13 +205,47 @@ html.henge-on #henge-panel-placeholder {
     color: var(--text-subdued, #b3b3b3);
     font-size: 14px;
 }
+/* ── Pinned panels ── */
+
+html.henge-on .henge-view {
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    min-width: 0;
+    min-height: 0;
+    overflow: hidden;
+    border-radius: 8px;
+    background-color: var(--background-base, #121212);
+}
+/* Carries the captured <aside>'s own classes, so Spotify styles the copy
+   exactly like the original panel. */
+html.henge-on .henge-view-content {
+    flex: 1 1 auto;
+    position: relative;
+    width: 100% !important;
+    height: auto !important;
+    min-height: 0;
+}
+.henge-view-msg {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    height: 100%;
+    padding: 16px;
+    color: var(--text-subdued, #b3b3b3);
+    font-size: 14px;
+    text-align: center;
+}
 #henge-panel-placeholder .henge-ph-buttons {
     display: flex;
     flex-wrap: wrap;
     justify-content: center;
     gap: 8px;
 }
-#henge-panel-placeholder button {
+#henge-panel-placeholder button,
+.henge-view-msg button {
     padding: 6px 14px;
     border: 1px solid var(--essential-subdued, #727272);
     border-radius: 999px;
@@ -214,7 +254,8 @@ html.henge-on #henge-panel-placeholder {
     font: inherit;
     cursor: pointer;
 }
-#henge-panel-placeholder button:hover {
+#henge-panel-placeholder button:hover,
+.henge-view-msg button:hover {
     border-color: var(--text-base, #fff);
 }
 
@@ -300,12 +341,13 @@ html.henge-on.henge-resizing .henge-handle {
         const FULL_ROW = 'grid-column: 1 / -1 !important;';
         const BOTH_ROWS = 'grid-row: main-view-start / left-sidebar-end !important;';
 
-        // Place, or hide, each Spotify source. Hidden ones stay mounted.
-        for (const src of ['main', 'library', 'panel']) {
+        // Place, or hide, each source. Hidden Spotify sources stay mounted;
+        // pinned panels only exist while placed, so need no hiding.
+        for (const [src, def] of Object.entries(SOURCES)) {
+            if (src === 'none') continue;
             const slot = slotOf(l, src);
-            add(`${H} ${SOURCES[src].sel}`, slot
-                ? `grid-area: ${AREA[slot]} !important;`
-                : 'display: none !important;');
+            if (slot) add(`${H} ${def.sel}`, `grid-area: ${AREA[slot]} !important;`);
+            else if (!def.pinned) add(`${H} ${def.sel}`, 'display: none !important;');
         }
 
         // A bottom slot that's empty lets its neighbour take the whole row.
@@ -628,9 +670,10 @@ html.henge-on.henge-resizing .henge-handle {
     function clickControl(name) {
         for (const sel of PANEL_CONTROLS[name]) {
             const el = document.querySelector(sel);
-            if (el) { el.click(); return; }
+            if (el) { el.click(); return true; }
         }
         notify(`Couldn't find Spotify's ${name} button`, true);
+        return false;
     }
 
     const panelPlaceholder = (() => {
@@ -650,10 +693,349 @@ html.henge-on.henge-resizing .henge-handle {
     })();
 
     function ensureExtras(root) {
-        for (const el of [rowHandle, colHandle, panelPlaceholder]) {
+        for (const el of [rowHandle, colHandle, panelPlaceholder, ...[...views.values()].map(v => v.el)]) {
             if (el.parentElement !== root) root.appendChild(el);
         }
     }
+
+    // ── React internals ───────────────────────────────────────────────────────
+    // Spotify's React tree, read through the fibres React hangs off DOM nodes.
+    // Generic on purpose (no hashed names), so Spotify updates are less likely
+    // to break it. Spotify runs React 18.3.1.
+
+    const COMPOSITE_TAGS = new Set([0, 1, 11, 14, 15]); // function, class, forwardRef, memo, simple memo
+    const PROVIDER_TAG = 10;
+    const HOST_ROOT_TAG = 3;
+    const ASIDE_ID = 'Desktop_PanelContainer_Id';
+
+    function fiberOf(el) {
+        const key = el && Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+        return key ? el[key] : null;
+    }
+
+    function fiberName(f) {
+        const t = f.elementType ?? f.type;
+        return t?.displayName || t?.name || t?.render?.displayName || t?.render?.name
+            || t?.type?.displayName || t?.type?.name || `(anonymous, tag ${f.tag})`;
+    }
+
+    // A DOM node's fibre can be the stale half of React's current/alternate
+    // pair. Walk up to the root, then back down the *current* tree along the
+    // same path. Returns current fibres leaf-first, or null if the path is no
+    // longer mounted.
+    function currentPath(fiber) {
+        const chain = [];
+        for (let f = fiber; f; f = f.return) chain.push(f);
+        const top = chain[chain.length - 1];
+        if (!top || top.tag !== HOST_ROOT_TAG || !top.stateNode?.current) return null;
+        let cur = top.stateNode.current;
+        const out = [cur];
+        for (let i = chain.length - 2; i >= 0; i--) {
+            const target = chain[i];
+            let c = cur.child;
+            while (c && c !== target && c.alternate !== target) c = c.sibling;
+            if (!c) return null;
+            out.push(c);
+            cur = c;
+        }
+        return out.reverse();
+    }
+
+    // Component fibres under a fibre, depth-first, outermost first.
+    function componentsUnder(fiber, limit = 12, maxDepth = 8) {
+        const out = [];
+        const stack = [[fiber.child, 0]];
+        while (stack.length && out.length < limit) {
+            const [f, depth] = stack.pop();
+            if (!f) continue;
+            if (COMPOSITE_TAGS.has(f.tag)) out.push({ fiber: f, depth });
+            if (f.sibling) stack.push([f.sibling, depth]);
+            if (f.child && depth < maxDepth) stack.push([f.child, depth + 1]);
+        }
+        return out;
+    }
+
+    // Context providers from a fibre up to the root, innermost first.
+    function providersAbove(fiber) {
+        const list = [];
+        for (let f = fiber; f; f = f.return) {
+            if (f.tag === PROVIDER_TAG) list.push({ fiber: f, type: f.type, value: f.memoizedProps?.value });
+        }
+        return list;
+    }
+
+    // Spicetify.ReactDOM is the module with createPortal; createRoot may live
+    // in react-dom/client. Look in webpack's cache of already-loaded modules
+    // only, so nothing new gets executed.
+    let createRootFn;
+    function getCreateRoot() {
+        if (createRootFn !== undefined) return createRootFn;
+        createRootFn = null;
+        if (typeof Spicetify.ReactDOM?.createRoot === 'function') return (createRootFn = Spicetify.ReactDOM.createRoot);
+        let req = null;
+        try { window.webpackChunkclient_web.push([[Symbol('henge')], {}, r => { req = r; }]); } catch {}
+        for (const mod of Object.values(req?.c ?? {})) {
+            const ex = mod?.exports;
+            if (ex && typeof ex.createRoot === 'function' && typeof ex.hydrateRoot === 'function') {
+                return (createRootFn = ex.createRoot);
+            }
+        }
+        return createRootFn;
+    }
+
+    // ── Pinned panels ─────────────────────────────────────────────────────────
+    // A pinned panel is a live second copy of one of Spotify's side-panel views
+    // (Now Playing, Queue, Friend Activity), rendered by Henge into its own grid
+    // item with Spotify's own component. Proven by the Henge.spike() experiment
+    // on 2026-10-04: menus, playback, drag and live updates all work.
+    //
+    // Capture: while the real side panel shows the view, take the outermost
+    // component under its <aside> (element + props) and every context provider
+    // above it. If it isn't showing, Henge clicks Spotify's button to open it,
+    // captures, and puts the side panel back. Captures last for the session.
+    //
+    // Context values: app-wide providers (those above #main-view too) are
+    // re-read from the live tree every couple of seconds so the copy never
+    // goes stale. Panel-local providers keep their captured values on purpose:
+    // they're what tell a pinned Queue that it is the Queue.
+
+    const LS_PANEL_LABELS = 'henge:panelLabels'; // aside aria-label → kind, learned
+    const captured = {};                          // kind → capture
+    const views = new Map();                      // kind → { el, content, root, values, error, attempt }
+
+    const panelLabels = (() => {
+        try { return JSON.parse(lsGet(LS_PANEL_LABELS)) ?? {}; } catch { return {}; }
+    })();
+
+    function learnLabel(label, kind) {
+        if (!label || panelLabels[label] === kind) return;
+        panelLabels[label] = kind;
+        lsSet(LS_PANEL_LABELS, JSON.stringify(panelLabels));
+    }
+
+    const panelAsides = () => document.querySelectorAll(`#${ASIDE_ID}`);
+    // The side panel's <aside>, once any open/close animation has finished
+    // (during one, two can be mounted).
+    const settledAside = () => { const a = panelAsides(); return a.length === 1 ? a[0] : null; };
+
+    function asideComponents(aside, limit = 8) {
+        const fiber = fiberOf(aside);
+        if (!fiber) return [];
+        const path = currentPath(fiber);
+        return componentsUnder(path ? path[0] : fiber, limit);
+    }
+
+    // Identifies what the side panel is showing, to notice when it changes.
+    function panelSignature(aside) {
+        return `${aside.getAttribute('aria-label') ?? ''}|${asideComponents(aside).map(c => fiberName(c.fiber)).join(',')}`;
+    }
+
+    // Which pinned kind the side panel is showing: learned labels first, then
+    // what's recognisable without having learned anything.
+    function kindOfAside(aside) {
+        const label = aside.getAttribute('aria-label') ?? '';
+        if (panelLabels[label]) return panelLabels[label];
+        if (asideComponents(aside).some(c => /NowPlayingView/.test(fiberName(c.fiber)))) return 'nowplaying';
+        if (/^queue$/i.test(label)) return 'queue';
+        if (/friend|listening activity/i.test(label)) return 'friends';
+        return null;
+    }
+
+    function captureAside(aside) {
+        const top = asideComponents(aside, 1)[0];
+        if (!top) throw new Error('the side panel has no component yet');
+        return {
+            element: Spicetify.React.createElement(top.fiber.elementType ?? top.fiber.type, { ...top.fiber.memoizedProps }),
+            providers: providersAbove(top.fiber.return),
+            asideClass: aside.className,
+            label: aside.getAttribute('aria-label'),
+        };
+    }
+
+    async function waitFor(pred, timeout = 2500, step = 50) {
+        const end = Date.now() + timeout;
+        while (Date.now() < end) {
+            let v = null;
+            try { v = pred(); } catch {}
+            if (v) return v;
+            await sleep(step);
+        }
+        return null;
+    }
+
+    // Open `kind` in the real side panel (if needed), capture it, put the
+    // side panel back the way it was.
+    async function openAndCapture(kind) {
+        const control = SOURCES[kind].control;
+        const before = settledAside();
+        const wasOpen = !!document.getElementById(ASIDE_ID);
+        const beforeKind = before ? kindOfAside(before) : null;
+
+        if (before && beforeKind === kind) {
+            captured[kind] = captureAside(before);
+            learnLabel(captured[kind].label, kind);
+            return;
+        }
+
+        const beforeSig = before ? panelSignature(before) : null;
+        if (!clickControl(control)) throw new Error(`Spotify's ${control} button wasn't found`);
+
+        // Either the wanted view appears, or the panel shuts: Spotify's buttons
+        // toggle, so that means it was already showing (unrecognised).
+        const opened = () => {
+            const a = settledAside();
+            if (a) return panelSignature(a) !== beforeSig ? a : null;
+            return wasOpen && !document.getElementById(ASIDE_ID) ? 'closed' : null;
+        };
+        let after = await waitFor(opened);
+        let wasThisKind = false;
+        if (after === 'closed') {
+            await sleep(300); // a switch can pass through "no panel"; make sure
+            after = settledAside() ?? 'closed';
+            if (after === 'closed') {
+                wasThisKind = true;
+                clickControl(control);
+                after = await waitFor(settledAside);
+            }
+        }
+        if (!after || after === 'closed') throw new Error(`${SOURCES[kind].label} didn't open`);
+
+        await sleep(300); // let the panel settle
+        const cap = captureAside(settledAside() ?? after);
+        captured[kind] = cap;
+        learnLabel(cap.label, kind);
+
+        // Put the side panel back.
+        if (!wasOpen) clickControl(control);
+        else if (!wasThisKind && beforeKind && beforeKind !== kind) clickControl(SOURCES[beforeKind].control);
+    }
+
+    // One capture at a time: each one drives the real side panel.
+    let captureChain = Promise.resolve();
+    const capturing = new Map();
+
+    function ensureCaptured(kind) {
+        if (captured[kind]) return Promise.resolve();
+        if (capturing.has(kind)) return capturing.get(kind);
+        const p = captureChain
+            .then(() => (captured[kind] ? null : openAndCapture(kind)))
+            .finally(() => capturing.delete(kind));
+        captureChain = p.catch(() => {});
+        capturing.set(kind, p);
+        return p;
+    }
+
+    // Context values for a capture: app-wide providers re-read live.
+    function freshValues(cap) {
+        const live = new Map();
+        for (const f of currentPath(fiberOf(document.getElementById('main-view'))) ?? []) {
+            if (f.tag !== PROVIDER_TAG) continue;
+            live.set(f, f.memoizedProps?.value);
+            if (f.alternate) live.set(f.alternate, f.memoizedProps?.value);
+        }
+        return cap.providers.map(p => (live.has(p.fiber) ? live.get(p.fiber) : p.value));
+    }
+
+    let ViewBoundary = null;
+    function viewBoundary() {
+        if (ViewBoundary) return ViewBoundary;
+        const R = Spicetify.React;
+        ViewBoundary = class HengeViewBoundary extends R.Component {
+            constructor(props) { super(props); this.state = { error: null }; }
+            static getDerivedStateFromError(error) { return { error }; }
+            componentDidCatch(error) { warn(`${this.props.label} crashed:`, error); }
+            render() {
+                if (!this.state.error) return this.props.children;
+                return viewMessage(`${this.props.label} stopped working.`, this.props.onRetry);
+            }
+        };
+        return ViewBoundary;
+    }
+
+    function viewMessage(text, onRetry) {
+        const R = Spicetify.React;
+        return R.createElement('div', { className: 'henge-view-msg' },
+            text,
+            onRetry ? R.createElement('button', { onClick: onRetry }, 'Retry') : null);
+    }
+
+    function renderView(kind) {
+        const v = views.get(kind);
+        if (!v) return;
+        const R = Spicetify.React;
+        const label = SOURCES[kind].label;
+        const createRoot = getCreateRoot();
+        if (!createRoot) {
+            v.content.textContent = `Henge can't show ${label}: React's createRoot wasn't found.`;
+            return;
+        }
+        v.root ??= createRoot(v.content);
+        const cap = captured[kind];
+        if (!cap) {
+            v.content.className = 'henge-view-content';
+            v.values = null;
+            v.root.render(v.error
+                ? viewMessage(`Couldn't load ${label}: ${v.error}`, () => loadView(kind, true))
+                : viewMessage(`Loading ${label}…`));
+            return;
+        }
+        v.content.className = `henge-view-content ${cap.asideClass}`;
+        v.values = freshValues(cap);
+        let el = cap.element;
+        cap.providers.forEach((p, i) => { el = R.createElement(p.type, { value: v.values[i] }, el); });
+        v.root.render(R.createElement(viewBoundary(), { key: v.attempt, label, onRetry: () => loadView(kind, true) }, el));
+    }
+
+    // (Re)capture if needed, then render. retry=true drops the old capture.
+    function loadView(kind, retry = false) {
+        const v = views.get(kind);
+        if (!v) return;
+        if (retry) { delete captured[kind]; v.attempt++; }
+        v.error = null;
+        renderView(kind);
+        ensureCaptured(kind).then(
+            () => renderView(kind),
+            e => { warn(`couldn't capture ${kind}:`, e); if (views.get(kind) === v) { v.error = e.message; renderView(kind); } });
+    }
+
+    function mountView(kind) {
+        const el = document.createElement('div');
+        el.id = `henge-view-${kind}`;
+        el.className = 'henge-view';
+        const content = document.createElement('div');
+        content.className = 'henge-view-content';
+        el.append(content);
+        views.set(kind, { el, content, root: null, values: null, error: null, attempt: 0 });
+        getRoot()?.appendChild(el);
+        loadView(kind);
+    }
+
+    function unmountView(kind) {
+        const v = views.get(kind);
+        if (!v) return;
+        views.delete(kind);
+        try { v.root?.unmount(); } catch {}
+        v.el.remove();
+    }
+
+    // Mount the pinned panels the layout places, unmount the rest.
+    function syncViews() {
+        const wanted = new Set(isOn() ? SLOTS.map(s => layout[s]).filter(src => SOURCES[src]?.pinned) : []);
+        for (const kind of [...views.keys()]) if (!wanted.has(kind)) unmountView(kind);
+        for (const kind of wanted) if (!views.has(kind)) mountView(kind);
+    }
+
+    // Re-render a pinned panel when an app-wide context value has changed.
+    function refreshViews() {
+        for (const [kind, v] of views) {
+            const cap = captured[kind];
+            if (!cap || !v.values) continue;
+            const next = freshValues(cap);
+            if (next.some((val, i) => val !== v.values[i])) renderView(kind);
+        }
+    }
+
+    setInterval(() => { if (isOn() && views.size) refreshViews(); }, 2000);
 
     // ── Watching Spotify ──────────────────────────────────────────────────────
     // Targeted observers on the library (its class and inline width change with
@@ -725,6 +1107,7 @@ html.henge-on.henge-resizing .henge-handle {
     function applyLayout() {
         styleTag(LAYOUT_ID).textContent = buildLayoutCSS(layout);
         for (const slot of SLOTS) html.dataset[`henge${slot[0].toUpperCase()}${slot.slice(1)}`] = layout[slot];
+        syncViews();
     }
 
     function injectStyle() {
@@ -932,6 +1315,7 @@ html.henge-on.henge-resizing .henge-handle {
             html.classList.add(ROOT_CLASS);
             hooked = { root: null, left: null }; // force a fresh hook
             hook();
+            syncViews();
             updateState();
             if (persist) writeEnabled(true);
             selfCheck();
@@ -946,6 +1330,7 @@ html.henge-on.henge-resizing .henge-handle {
         html.classList.remove(ROOT_CLASS, 'henge-lib-collapsed', 'henge-lib-expanded', 'henge-resizing');
         observer.disconnect();
         for (const el of [rowHandle, colHandle, panelPlaceholder]) el.remove();
+        syncViews(); // off: unmounts every pinned panel
         removeStyle();
         if (persist) writeEnabled(false);
         renderPicker();
@@ -1091,67 +1476,15 @@ html.henge-on.henge-resizing .henge-handle {
         return copyOut('probe', out);
     }
 
-    // ── Spike: a second live copy of Spotify's side panel ─────────────────────
-    // Experiment (2026-10-04): can Spotify's own panel components run twice?
-    // Henge.spike() takes whatever the side panel shows right now — its React
-    // component, props, and every context provider above it — and renders a
-    // second copy in a floating box. Then switch the real side panel to
-    // something else and see whether the copy stays alive and interactive.
-    //   Henge.spike()        render candidate 0 (the outermost panel component)
-    //   Henge.spike(n)       render candidate n from the report instead
-    //   Henge.spikeClose()   close every spike box
-
-    const COMPOSITE_TAGS = new Set([0, 1, 11, 14, 15]); // function, class, forwardRef, memo, simple memo
-    const PROVIDER_TAG = 10;
-
-    function fiberOf(el) {
-        const key = el && Object.keys(el).find(k => k.startsWith('__reactFiber$'));
-        return key ? el[key] : null;
-    }
-
-    function fiberName(f) {
-        const t = f.elementType ?? f.type;
-        return t?.displayName || t?.name || t?.render?.displayName || t?.render?.name
-            || t?.type?.displayName || t?.type?.name || `(anonymous, tag ${f.tag})`;
-    }
-
-    // Composite (component) fibers under the aside, depth-first, outermost first.
-    function panelCandidates(asideFiber, limit = 12) {
-        const out = [];
-        const stack = [[asideFiber.child, 0]];
-        while (stack.length && out.length < limit) {
-            const [f, depth] = stack.pop();
-            if (!f) continue;
-            if (COMPOSITE_TAGS.has(f.tag)) out.push({ fiber: f, depth });
-            if (f.sibling) stack.push([f.sibling, depth]);
-            if (f.child && depth < 8) stack.push([f.child, depth + 1]);
-        }
-        return out;
-    }
-
-    // Context providers from a fibre up to the root, innermost first. The
-    // provider's fibre type renders as the provider in React 18 and 19 alike.
-    function providersAbove(fiber) {
-        const list = [];
-        for (let f = fiber; f; f = f.return) {
-            if (f.tag === PROVIDER_TAG) list.push({ type: f.type, value: f.memoizedProps?.value });
-        }
-        return list;
-    }
-
-    // Spicetify.ReactDOM is the module with createPortal; createRoot may live
-    // in react-dom/client. Look in webpack's cache of already-loaded modules
-    // only, so nothing new gets executed.
-    function findCreateRoot() {
-        if (typeof Spicetify.ReactDOM?.createRoot === 'function') return Spicetify.ReactDOM.createRoot;
-        let req = null;
-        try { window.webpackChunkclient_web.push([[Symbol('henge')], {}, r => { req = r; }]); } catch {}
-        for (const mod of Object.values(req?.c ?? {})) {
-            const ex = mod?.exports;
-            if (ex && typeof ex.createRoot === 'function' && typeof ex.hydrateRoot === 'function') return ex.createRoot;
-        }
-        return null;
-    }
+    // ── Spike: a second live copy of a Spotify view ───────────────────────────
+    // Experiment harness (2026-10-04) that proved pinned panels possible; kept
+    // for trying new sources, e.g. a page from the main view such as lyrics.
+    // Renders a component from the live tree a second time, in a floating box,
+    // with every context provider above it.
+    //   Henge.spike()              side panel, candidate 0 (outermost component)
+    //   Henge.spike(n)             side panel, candidate n from the report
+    //   Henge.spike(n, 'main')     main view instead of the side panel
+    //   Henge.spikeClose()         close every spike box
 
     function spikeBoundary() {
         const R = Spicetify.React;
@@ -1199,17 +1532,23 @@ html.henge-on.henge-resizing .henge-handle {
         return { box, content, close };
     }
 
-    function spike(index = 0) {
+    function spike(index = 0, from = 'panel') {
         const R = Spicetify.React;
-        const report = { henge: VERSION, react: R?.version ?? null };
+        const report = { henge: VERSION, react: R?.version ?? null, from };
         const done = () => copyOut('spike', report);
 
-        const aside = document.getElementById('Desktop_PanelContainer_Id');
-        if (!aside) { report.error = 'Open the side panel first (Queue or Now Playing).'; return done(); }
-        const asideFiber = fiberOf(aside);
-        if (!asideFiber) { report.error = 'No React fibre on the side panel element.'; return done(); }
+        const anchor = from === 'main'
+            ? document.querySelector('#main-view .main-view-container') ?? document.getElementById('main-view')
+            : document.getElementById(ASIDE_ID);
+        if (!anchor) { report.error = from === 'main' ? 'No main view found.' : 'Open the side panel first.'; return done(); }
+        const fiber = fiberOf(anchor);
+        if (!fiber) { report.error = 'No React fibre on that element.'; return done(); }
+        report.location = location.pathname;
 
-        const candidates = panelCandidates(asideFiber);
+        // The main view's page sits deeper, so look further down.
+        const candidates = from === 'main'
+            ? componentsUnder(currentPath(fiber)?.[0] ?? fiber, 40, 40)
+            : componentsUnder(currentPath(fiber)?.[0] ?? fiber);
         report.candidates = candidates.map((c, i) => ({
             i, depth: c.depth, tag: c.fiber.tag, name: fiberName(c.fiber),
             props: Object.keys(c.fiber.memoizedProps ?? {}),
@@ -1217,7 +1556,7 @@ html.henge-on.henge-resizing .henge-handle {
         const pick = candidates[index];
         if (!pick) { report.error = `No candidate ${index}.`; return done(); }
 
-        const createRoot = findCreateRoot();
+        const createRoot = getCreateRoot();
         report.createRoot = !!createRoot;
         if (!createRoot) { report.error = 'Could not find ReactDOM createRoot.'; return done(); }
 
@@ -1228,7 +1567,7 @@ html.henge-on.henge-resizing .henge-handle {
         for (const p of providers) el = R.createElement(p.type, { value: p.value }, el);
 
         const name = fiberName(pick.fiber);
-        const { box, content, close } = spikeBox(`#${index} ${name}`, aside.className);
+        const { box, content, close } = spikeBox(`#${index} ${name}`, from === 'main' ? '' : anchor.className);
         try {
             const root = createRoot(content);
             root.render(R.createElement(spikeBoundary(), null, el));

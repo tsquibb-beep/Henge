@@ -15,6 +15,7 @@ const show = (name, l) => { console.log(`\n=== ${name} ${JSON.stringify(l)} vali
 show('default', DEFAULT_LAYOUT);
 show('panel top, main left', { top: 'panel', left: 'main', right: 'library' });
 show('library none', { top: 'main', left: 'none', right: 'panel' });
+show('pinned NPV + queue', { top: 'main', left: 'nowplaying', right: 'queue' });
 show('top none', { top: 'none', left: 'main', right: 'panel' });
 console.log('\nswap main<-library:', JSON.stringify(withSource(DEFAULT_LAYOUT, 'top', 'library')));
 console.log('left->none:', JSON.stringify(withSource(DEFAULT_LAYOUT, 'left', 'none')));
