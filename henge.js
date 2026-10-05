@@ -15,7 +15,7 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '0.5.6';
+    const VERSION = '0.6.0';
 
     const LS_ENABLED = 'henge:enabled';
     const LS_LAYOUT  = 'henge:layout';         // JSON {top, left, right}
@@ -447,6 +447,12 @@ html.henge-on.henge-resizing .henge-handle {
     // ── Picker CSS (always present, so the button works when Henge is off) ──
 
     const UI_CSS = `
+/* Spicetify gives top bar buttons the history buttons' class, which sizes
+   icons for 16px; Henge's is drawn at 24px like the custom-app icons. */
+.spicetify-topbar-button button[aria-label="Henge layout"] svg {
+    width: 24px;
+    height: 24px;
+}
 #henge-picker {
     position: fixed;
     z-index: 9999;
@@ -1337,11 +1343,27 @@ html.henge-on.henge-resizing .henge-handle {
 
     // ── Layout picker (top bar button + popover) ──────────────────────────────
 
-    const LAYOUT_ICON = `<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.3">
-<rect x="1.5" y="1.5" width="13" height="6.5" rx="1"/><rect x="1.5" y="9.5" width="6" height="5" rx="1"/><rect x="9" y="9.5" width="5.5" height="5" rx="1"/></svg>`;
+    // 24px outline, matching the custom-app icons beside it (Marketplace's
+    // cart etc.): a lintel over two equal squares, 2px gaps, 2px stroke.
+    const LAYOUT_ICON = `<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round">
+<rect x="3" y="3" width="18" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>`;
+
+    // The popover closes by itself this long after the pointer leaves it
+    // (moving back in cancels). Paused while one of its dropdowns is open,
+    // since the open list can hang outside the popover.
+    const PICKER_LINGER_MS = 2500;
 
     let picker = null;   // the open popover, or null
     let anchorEl = null; // the top bar button's element
+    let pointerInside = false;
+    let choosing = false;
+    let lingerTimer = null;
+
+    function armAutoClose() {
+        clearTimeout(lingerTimer);
+        if (!picker || pointerInside || choosing) return;
+        lingerTimer = setTimeout(closePicker, PICKER_LINGER_MS);
+    }
 
     function slotSelect(slot) {
         const select = document.createElement('select');
@@ -1364,9 +1386,13 @@ html.henge-on.henge-resizing .henge-handle {
             }
         }
         select.prepend(...Object.values(groups));
+        select.addEventListener('mousedown', () => { choosing = true; clearTimeout(lingerTimer); });
+        select.addEventListener('blur', () => { choosing = false; armAutoClose(); });
         select.addEventListener('change', () => {
+            choosing = false;
             setLayout(withSource(layout, slot, select.value));
             renderPicker();
+            armAutoClose();
         });
         return select;
     }
@@ -1440,6 +1466,9 @@ html.henge-on.henge-resizing .henge-handle {
     }
 
     function closePicker() {
+        clearTimeout(lingerTimer);
+        pointerInside = false;
+        choosing = false;
         picker?.remove();
         picker = null;
         document.removeEventListener('pointerdown', onOutside, true);
@@ -1455,17 +1484,23 @@ html.henge-on.henge-resizing .henge-handle {
     }
 
     function openPicker() {
-        styleTag(UI_ID).textContent = UI_CSS;
         picker = document.createElement('div');
         picker.id = 'henge-picker';
         picker.setAttribute('role', 'dialog');
         picker.setAttribute('aria-label', 'Henge layout');
+        // Same rule from the start: opened and never visited, it closes too.
+        picker.addEventListener('pointerenter', () => { pointerInside = true; clearTimeout(lingerTimer); });
+        picker.addEventListener('pointerleave', () => { pointerInside = false; armAutoClose(); });
         document.body.append(picker);
         renderPicker();
         positionPicker();
         document.addEventListener('pointerdown', onOutside, true);
         document.addEventListener('keydown', onPickerKey, true);
+        armAutoClose();
     }
+
+    // Picker and button CSS, needed from the start for the icon size.
+    styleTag(UI_ID).textContent = UI_CSS;
 
     const layoutButton = new Spicetify.Topbar.Button('Henge layout', LAYOUT_ICON, () => {
         if (picker) closePicker(); else openPicker();

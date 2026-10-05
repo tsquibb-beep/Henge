@@ -36,7 +36,9 @@ The first time a pinned panel is shown in a session, Henge opens it in Spotify's
 panel (or, for Lyrics, the main view) for a moment to borrow it, then puts things back
 as they were.
 
-Picking something that's already in another panel swaps the two. Your layout is
+The map closes by itself a couple of seconds after your mouse leaves it. You can
+also click elsewhere or press Escape. Picking something that's already in another
+panel swaps the two. Your layout is
 remembered between restarts. If a choice would leave the main view or the now-playing
 bar squashed or off screen, Henge puts the previous layout back.
 
@@ -73,6 +75,10 @@ being tested with:
 - Extensions: "Made For You" shortcut, Shuffle+, Collapsing Library, Beautiful Lyrics
 
 Tested on Spotify 1.3.3 with Spicetify 2.45.3.
+
+**Not supported:** Spotify's Cinema modes (expanded Now Playing and lyrics cinema).
+They assume Spotify's own three-column layout, so they look broken while Henge is on.
+Press Ctrl+Alt+H to switch Henge off if you want to use them.
 
 ## Licence
 
