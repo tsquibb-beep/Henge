@@ -1,6 +1,6 @@
 // Offline check of Henge's generated layout CSS (no Spotify needed).
 // Run with Windows Node from the repo root:
-//   "/mnt/c/Program Files/nodejs/node.exe" tools/test-layout.js
+//   node tools/test-layout.js
 // Extracts the slot model and buildLayoutCSS() from henge.js and prints the
 // rules for a few layouts, plus swap/validation checks.
 const fs = require('fs');
