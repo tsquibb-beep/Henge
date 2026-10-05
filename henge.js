@@ -15,7 +15,16 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '1.0.0';
+    const VERSION = '1.0.1';
+
+    // One copy only. Installed both from Marketplace and in Spicetify's
+    // Extensions folder, two copies would load; claim the slot before the
+    // first await so the second sees it.
+    if (window.__hengeLoaded) {
+        console.warn(`[Henge] v${VERSION} not started: v${window.__hengeLoaded} is already running (installed twice?)`);
+        return;
+    }
+    window.__hengeLoaded = VERSION;
 
     const LS_ENABLED = 'henge:enabled';
     const LS_LAYOUT  = 'henge:layout';         // JSON {top, left, right}

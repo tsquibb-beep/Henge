@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Henge",
+    "description": "Stacked layout for tall screens: the main view full width with two panels below. Pick what each panel shows, including live copies of Now Playing, Queue and Lyrics side by side. Ctrl+Alt+H toggles it.",
+    "preview": "docs/preview.png",
+    "main": "henge.js",
+    "readme": "README.md",
+    "branch": "release",
+    "authors": [
+      { "name": "Tom Squibb", "url": "https://github.com/tsquibb-beep" }
+    ],
+    "tags": ["layout", "panels"]
+  }
+]

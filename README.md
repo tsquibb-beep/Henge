@@ -17,10 +17,20 @@ Playing, the Queue, Lyrics and more.
 
 Drag the handles between panels to resize them. Double-click a handle to reset it.
 
+![Henge: the main view on top, pinned Now Playing and Queue below](docs/preview.png)
+
 ## Install
 
 You need the Spotify desktop app with [Spicetify](https://spicetify.app/docs/getting-started)
 already installed and working.
+
+### From Spicetify Marketplace (easiest)
+
+Open **Marketplace** in Spotify, search the **Extensions** tab for **Henge**, and click
+**Install**. Use either Marketplace or the manual install below, not both. If both are
+present, only one copy runs.
+
+### Manually
 
 1. Download `henge.js` from the [latest release](https://github.com/tsquibb-beep/Henge/releases/latest).
 2. Put it in Spicetify's Extensions folder:
@@ -40,11 +50,13 @@ between Henge and Spotify's normal layout.
 **Windows shortcut:** if you've cloned this repository, double-click
 `scripts\henge-on.cmd`. It copies `henge.js` into place, registers it and applies.
 
-**Updating:** download the new `henge.js` over the old one and run `spicetify apply`.
-Your layout and panel sizes are kept.
+**Updating:** Marketplace updates Henge for you. For a manual install, download the
+new `henge.js` over the old one and run `spicetify apply`. Either way, your layout and
+panel sizes are kept.
 
-**Uninstalling:** run `spicetify config extensions henge.js-`, then `spicetify apply`.
-On Windows you can double-click `scripts\henge-off.cmd` instead.
+**Uninstalling:** from Marketplace, click **Remove** on Henge's card. For a manual
+install, run `spicetify config extensions henge.js-`, then `spicetify apply`. On
+Windows you can double-click `scripts\henge-off.cmd` instead.
 
 ## Choosing what each panel shows
 
@@ -89,6 +101,8 @@ Henge is an extension, not a theme, so it works on top of your existing theme.
 - **Tested on:** Spotify 1.3.3 with Spicetify 2.45.3, on Windows.
 - **Works alongside:** the Sleek theme, and the "Made For You" shortcut, Shuffle+ and
   Collapsing Library extensions.
+- **Themes:** most themes work. Themes that rearrange Spotify's layout themselves may
+  not look right with Henge. Press Ctrl+Alt+H to compare.
 - **Not supported:** Spotify's Cinema modes (expanded Now Playing and lyrics cinema).
   They assume Spotify's own three-column layout, so they look broken while Henge is on.
   Press Ctrl+Alt+H to switch Henge off if you want to use them.
