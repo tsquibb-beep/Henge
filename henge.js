@@ -15,7 +15,7 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '1.0.1';
+    const VERSION = '1.0.2';
 
     // One copy only. Installed both from Marketplace and in Spicetify's
     // Extensions folder, two copies would load; claim the slot before the
