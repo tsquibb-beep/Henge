@@ -103,6 +103,8 @@ Henge is an extension, not a theme, so it works on top of your existing theme.
 - **Tested on:** Spotify 1.3.3 with Spicetify 2.45.3, on Windows.
 - **Works alongside:** the Sleek theme, and the "Made For You" shortcut, Shuffle+ and
   Collapsing Library extensions.
+- **Lyrics extensions:** the pinned Lyrics panel borrows Spotify's own lyrics page, so it
+  doesn't work alongside extensions that replace that page, such as Beautiful Lyrics.
 - **Themes:** most themes work. Themes that rearrange Spotify's layout themselves may
   not look right with Henge. Press Ctrl+Alt+H to compare.
 - **Not supported:** Spotify's Cinema modes (expanded Now Playing and lyrics cinema).
