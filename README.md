@@ -17,7 +17,7 @@ Playing, the Queue, Lyrics and more.
 
 Drag the handles between panels to resize them. Double-click a handle to reset it.
 
-![Henge: the main view on top, pinned Now Playing and Queue below](docs/preview.png)
+![Henge: a playlist in the main view on top, pinned Now Playing and Lyrics below](docs/screenshot.png)
 
 ## Install
 
@@ -62,6 +62,8 @@ Windows you can double-click `scripts\henge-off.cmd` instead.
 
 Click the **Henge layout** button in the top bar. It shows a small map of the three
 panels (top, bottom left, bottom right), each with a dropdown:
+
+![The Henge layout map: a dropdown for the top, bottom left and bottom right panels](docs/hengemenu.png)
 
 - **Main view:** the page you're browsing. It always has to be somewhere.
 - **Library**
