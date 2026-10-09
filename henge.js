@@ -15,7 +15,7 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '1.0.2';
+    const VERSION = '1.0.3';
 
     // One copy only. Installed both from Marketplace and in Spicetify's
     // Extensions folder, two copies would load; claim the slot before the
@@ -259,6 +259,24 @@ html.henge-on #henge-view-lyrics .henge-view-content {
    so the view has to as well. Name from Spotify's CSS (1.3.3). */
 html.henge-on #henge-view-lyrics {
     timeline-scope: --scroll-to-viewport-button-anim;
+}
+/* Instead of lyrics, Spotify may show a message (none for this song,
+   couldn't load, ad) or a spinner, centred in the page box. That box is
+   sized to the window (height: calc(100vh - 73px)), so in a shorter view the
+   message sat below the bottom edge. While one shows, size the page to the
+   view instead. The message's text is sized for the window width too; scale
+   it to the view's. Classes from Spotify 1.3.3 (message, message text,
+   spinner). */
+html.henge-on #henge-view-lyrics .henge-view-content :has(.lzSRPoTbAKaWG_T2CDlK, .fPIOq6k3nkToIHbUnayO) {
+    height: 100% !important;
+}
+html.henge-on #henge-view-lyrics .lzSRPoTbAKaWG_T2CDlK {
+    container-type: inline-size;
+}
+html.henge-on #henge-view-lyrics .bfuVjuVXkeriMvFjcZMD {
+    margin-inline: 8cqi;
+    font-size: clamp(1.5rem, 5.5cqi, 4.5rem);
+    line-height: 1.2;
 }
 /* Holds that button: centred, just above the bottom of the view. */
 html.henge-on .henge-view-after {
