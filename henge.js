@@ -92,7 +92,9 @@
         // Spotify's lyrics are a main-view page, not a side panel: captured
         // from the main view instead (see openAndCaptureMain).
         lyrics:     { label: 'Lyrics',          group: 'Pinned panels', sel: view('lyrics'),     child: view('lyrics'),     pinned: true, from: 'main', route: '/lyrics' },
-        none:       { label: 'Nothing',         group: null },
+        // Drawn by Henge itself (`own`), not captured: see "Visualiser".
+        visualiser: { label: 'Visualiser',      group: 'Henge',         sel: view('visualiser'), child: view('visualiser'), pinned: true, own: true },
+        none:      { label: 'Nothing',         group: null },
     };
 
     const DEFAULT_LAYOUT = { top: 'main', left: 'library', right: 'panel' };
@@ -301,6 +303,22 @@ html.henge-on .henge-view-after {
     color: var(--text-subdued, #b3b3b3);
     font-size: 14px;
     text-align: center;
+}
+/* The visualiser's canvas fills the view; its messages sit over it. */
+html.henge-on #henge-view-visualiser canvas {
+    position: absolute;
+    inset: 0;
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+html.henge-on #henge-view-visualiser .henge-view-msg {
+    position: absolute;
+    inset: 0;
+    height: auto;
+}
+html.henge-on #henge-view-visualiser .henge-view-msg[hidden] {
+    display: none;
 }
 #henge-panel-placeholder .henge-ph-buttons {
     display: flex;
@@ -534,6 +552,19 @@ html.henge-on.henge-resizing .henge-handle {
     background-color: var(--background-elevated-highlight, #3e3e3e);
     color: inherit;
     font: inherit;
+}
+#henge-picker .henge-picker-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
+}
+#henge-picker .henge-picker-row span {
+    flex: none;
+    color: var(--text-subdued, #b3b3b3);
+    font-size: 11px;
+    letter-spacing: .05em;
+    text-transform: uppercase;
 }
 #henge-picker .henge-picker-foot {
     display: flex;
@@ -1176,7 +1207,8 @@ html.henge-on.henge-resizing .henge-handle {
         if (ownScroll) watchScrollEnd(content);
         views.set(kind, { el, content, before, after, root: null, values: null, error: null, attempt: 0 });
         getRoot()?.appendChild(el);
-        loadView(kind);
+        if (SOURCES[kind].own) visualiser.mount(content);
+        else loadView(kind);
     }
 
     // A new song's lyrics start at the top, as they do in the main view.
@@ -1190,6 +1222,7 @@ html.henge-on.henge-resizing .henge-handle {
         const v = views.get(kind);
         if (!v) return;
         views.delete(kind);
+        if (SOURCES[kind].own) visualiser.unmount();
         try { v.root?.unmount(); } catch {}
         v.el.remove();
     }
@@ -1216,6 +1249,356 @@ html.henge-on.henge-resizing .henge-handle {
     }
 
     setInterval(() => { if (isOn() && views.size) refreshViews(); }, 2000);
+
+    // ── Visualiser ────────────────────────────────────────────────────────────
+    // A Henge-drawn panel: a <canvas> animated from Spotify's audio analysis
+    // for the current track (Spicetify.getAudioData(), i.e. spclient's
+    // audio-attributes/v1/audio-analysis). Spotify doesn't expose the audio
+    // itself, so the wave is rebuilt from the analysis against the playback
+    // position: segments (~0.3s each) give a loudness curve and 12 pitch
+    // values, beats give a pulse. Only spotify:track: URIs have analysis, so
+    // local files show a message instead.
+
+    const LS_VIS_STYLE = 'henge:visualiserStyle';
+    const VIS_STYLES = { mirror: 'Mirrored wave', line: 'Line', scroll: 'Scrolling waveform' };
+
+    // ── Visualiser maths (pure; tools/test-visualiser.js extracts this block) ──
+
+    const VIS_DB_FLOOR = -40;   // dB treated as silence
+    const VIS_WINDOW = 16;      // seconds shown by the scrolling waveform
+
+    const lerp = (a, b, f) => a + (b - a) * f;
+    const clamp01 = v => Math.max(0, Math.min(1, v));
+    const isTrackUri = uri => typeof uri === 'string' && uri.startsWith('spotify:track:');
+
+    // Index of the item (segment or beat) playing at t seconds: the last one
+    // starting at or before t, or -1 before the first. `hint` is the previous
+    // answer, usually still right or one short, which skips the search.
+    function indexAt(list, t, hint = -1) {
+        const n = list.length;
+        if (!n || t < list[0].start) return -1;
+        if (hint >= 0 && hint < n && list[hint].start <= t) {
+            if (hint + 1 >= n || list[hint + 1].start > t) return hint;
+            if (hint + 2 >= n || list[hint + 2].start > t) return hint + 1;
+        }
+        let lo = 0, hi = n - 1;
+        while (lo < hi) {
+            const mid = (lo + hi + 1) >> 1;
+            if (list[mid].start <= t) lo = mid; else hi = mid - 1;
+        }
+        return lo;
+    }
+
+    // A segment's loudness (dB) at t: rises from loudness_start to
+    // loudness_max at loudness_max_time, then heads for the next segment's
+    // start (or silence after the last one).
+    function loudnessAt(seg, next, t) {
+        const dt = t - seg.start;
+        const peak = seg.loudness_max_time ?? 0;
+        if (dt <= peak) return lerp(seg.loudness_start, seg.loudness_max, peak > 0 ? clamp01(dt / peak) : 1);
+        const end = next ? next.loudness_start : VIS_DB_FLOOR;
+        const rest = seg.duration - peak;
+        return lerp(seg.loudness_max, end, rest > 0 ? clamp01((dt - peak) / rest) : 1);
+    }
+
+    // dB to a 0…1 level, curved so quiet passages stay visibly lower.
+    const dbToLevel = db => clamp01((db - VIS_DB_FLOOR) / -VIS_DB_FLOOR) ** 1.5;
+
+    // 1 on a beat, fading over about a third of a second.
+    function beatPulse(beat, t) {
+        if (!beat) return 0;
+        const dt = t - beat.start;
+        return dt < 0 ? 0 : Math.exp(-dt / 0.12);
+    }
+
+    // The 12 pitch values at t, blended from this segment's towards the next.
+    function pitchesAt(seg, next, t) {
+        const a = seg.pitches, b = next?.pitches ?? a;
+        const f = clamp01((t - seg.start) / (seg.duration || 1));
+        return a.map((p, i) => lerp(p, b[i] ?? p, f));
+    }
+
+    // Catmull-Rom between p1 and p2.
+    const catmull = (p0, p1, p2, p3, f) => 0.5 * (2 * p1 + (p2 - p0) * f
+        + (2 * p0 - 5 * p1 + 4 * p2 - p3) * f * f + (3 * p1 - p0 - 3 * p2 + p3) * f * f * f);
+
+    // A smooth curve through the 12 pitch values, wrapping round (pitch
+    // classes are cyclic): u in [0, 12).
+    function chromaAt(p, u) {
+        const i = Math.floor(u), f = u - i;
+        const g = k => p[(((i + k) % 12) + 12) % 12];
+        return catmull(g(-1), g(0), g(1), g(2), f);
+    }
+
+    // Eases v towards target with time constant tau (seconds) over dt.
+    const ease = (v, target, dt, tau) => v + (target - v) * (1 - Math.exp(-dt / tau));
+
+    // ── Visualiser view ──
+
+    const visualiser = (() => {
+        let content = null, canvas = null, ctx = null, msg = null, resizeObs = null, housekeeping = null;
+        const saved = lsGet(LS_VIS_STYLE);
+        let style = Object.hasOwn(VIS_STYLES, saved ?? '') ? saved : 'mirror';
+        let colours = {};
+        const cache = new Map();   // uri → analysis, the last few tracks
+        let uri = null, data = null, state = 'idle', error = null, token = 0;
+        let raf = 0, lastFrame = 0, lastDrawnT = -1;
+        let level = 0, phase = 0, segIdx = -1, beatIdx = -1;
+        let pitches = new Array(12).fill(0);
+
+        const MESSAGES = {
+            idle: 'Play a song to see the visualiser.',
+            loading: 'Loading visualiser data…',
+            nodata: 'No visualiser data for this track.',
+        };
+
+        // Spicetify themes set --spice-* on :root, and Spotify's CSS uses them.
+        function readColours() {
+            const cs = getComputedStyle(html);
+            const v = name => cs.getPropertyValue(name).trim();
+            const next = {
+                accent: v('--spice-button-active') || v('--spice-button') || '#1ed760',
+                text: v('--spice-text') || '#ffffff',
+                subdued: v('--spice-subtext') || '#b3b3b3',
+            };
+            const changed = JSON.stringify(next) !== JSON.stringify(colours);
+            colours = next;
+            return changed;
+        }
+
+        function showState(next, err = null) {
+            state = next;
+            error = err;
+            if (!msg) return;
+            msg.replaceChildren();
+            msg.hidden = state === 'ready';
+            if (state === 'error') {
+                const retry = document.createElement('button');
+                retry.textContent = 'Retry';
+                retry.addEventListener('click', () => { cache.delete(uri); load(); });
+                msg.append(`Couldn't load visualiser data: ${error}`, retry);
+            } else if (MESSAGES[state]) {
+                msg.append(MESSAGES[state]);
+            }
+        }
+
+        async function fetchAnalysis(u) {
+            if (Spicetify.getAudioData) return Spicetify.getAudioData(u);
+            return Spicetify.CosmosAsync.get(
+                `https://spclient.wg.spotify.com/audio-attributes/v1/audio-analysis/${u.split(':')[2]}?format=json`);
+        }
+
+        // Loads the current track's analysis; a later call wins over a slow one.
+        async function load() {
+            const mine = ++token;
+            uri = Spicetify.Player?.data?.item?.uri ?? null;
+            data = null;
+            segIdx = beatIdx = -1;
+            if (!uri) return showState('idle');
+            if (!isTrackUri(uri)) return showState('nodata');
+            if (cache.has(uri)) {
+                data = cache.get(uri);
+                return showState(data ? 'ready' : 'nodata');
+            }
+            showState('loading');
+            try {
+                const d = await fetchAnalysis(uri);
+                if (mine !== token) return;
+                const usable = d?.segments?.length ? d : null;
+                cache.set(uri, usable);
+                while (cache.size > 5) cache.delete(cache.keys().next().value);
+                data = usable;
+                showState(usable ? 'ready' : 'nodata');
+            } catch (e) {
+                if (mine !== token) return;
+                warn('visualiser data:', e);
+                showState('error', e?.message ?? String(e));
+            }
+            wake();
+        }
+
+        function fitCanvas() {
+            const dpr = window.devicePixelRatio || 1;
+            const w = Math.round(content.clientWidth * dpr), h = Math.round(content.clientHeight * dpr);
+            if (canvas.width !== w || canvas.height !== h) {
+                canvas.width = w;
+                canvas.height = h;
+            }
+        }
+
+        // getProgress() throws before anything has played (no player state).
+        const progress = () => {
+            try { return (Spicetify.Player?.getProgress?.() ?? 0) / 1000; } catch { return 0; }
+        };
+        const playing = () => !!Spicetify.Player?.isPlaying?.();
+
+        // Height (0…1) of the wave at x (0…1): the level, shaped by the
+        // pitch curve drifting across, tapered to nothing at the edges.
+        function amplitude(x, pulse) {
+            const u = ((x * 12 + phase) % 12 + 12) % 12;
+            const shape = 0.35 + 0.65 * clamp01(chromaAt(pitches, u));
+            return level * Math.sin(Math.PI * x) ** 0.8 * shape * (1 + 0.3 * pulse);
+        }
+
+        function drawWave(W, H, pulse) {
+            const dpr = window.devicePixelRatio || 1;
+            const mid = H / 2, max = mid - 4 * dpr;
+            const n = Math.max(2, Math.min(240, Math.round(W / (4 * dpr))));
+            const amps = Array.from({ length: n + 1 }, (_, i) => amplitude(i / n, pulse));
+            ctx.lineJoin = 'round';
+            // A faint centre line, so a flat (paused) panel isn't blank.
+            ctx.globalAlpha = 0.35;
+            ctx.fillStyle = colours.subdued;
+            ctx.fillRect(0, mid - dpr / 2, W, dpr);
+            ctx.globalAlpha = 1;
+            ctx.strokeStyle = colours.accent;
+            ctx.lineWidth = 2 * dpr;
+            ctx.beginPath();
+            if (style === 'line') {
+                // A trace rippling under the same envelope.
+                amps.forEach((a, i) => {
+                    const x = i / n;
+                    const y = mid - a * max * Math.sin(2 * Math.PI * 4 * x - phase * 2.5);
+                    if (i) ctx.lineTo(x * W, y); else ctx.moveTo(0, y);
+                });
+                ctx.stroke();
+                return;
+            }
+            amps.forEach((a, i) => { if (i) ctx.lineTo(i / n * W, mid - a * max); else ctx.moveTo(0, mid); });
+            for (let i = n; i >= 0; i--) ctx.lineTo(i / n * W, mid + amps[i] * max);
+            ctx.closePath();
+            ctx.globalAlpha = 0.35;
+            ctx.fillStyle = colours.accent;
+            ctx.fill();
+            ctx.globalAlpha = 1;
+            ctx.stroke();
+        }
+
+        // The track's loudness as bars scrolling past a centre "now" marker.
+        function drawScroll(W, H, t) {
+            const dpr = window.devicePixelRatio || 1;
+            const mid = H / 2, max = mid - 4 * dpr;
+            const barW = 3 * dpr, step = 5 * dpr;
+            const segs = data.segments, dur = data.track?.duration ?? Infinity;
+            const dtBar = VIS_WINDOW * step / W;
+            let idx = -1;
+            for (let tb = Math.ceil((t - VIS_WINDOW / 2) / dtBar) * dtBar; ; tb += dtBar) {
+                const x = W / 2 + (tb - t) / VIS_WINDOW * W;
+                if (x > W) break;
+                if (tb < 0 || tb > dur) continue;
+                idx = indexAt(segs, tb, idx);
+                if (idx < 0) continue;
+                const h = Math.max(dpr, dbToLevel(loudnessAt(segs[idx], segs[idx + 1], tb)) * max);
+                ctx.fillStyle = tb < t ? colours.subdued : colours.accent;
+                ctx.fillRect(x - barW / 2, mid - h, barW, 2 * h);
+            }
+            ctx.globalAlpha = 0.8;
+            ctx.fillStyle = colours.text;
+            ctx.fillRect(W / 2 - dpr, 0, 2 * dpr, H);
+            ctx.globalAlpha = 1;
+        }
+
+        function frame(now) {
+            raf = 0;
+            if (!canvas) return;
+            const dt = lastFrame ? Math.min(0.1, (now - lastFrame) / 1000) : 0;
+            lastFrame = now;
+            const t = progress(), on = playing();
+            let target = 0, pulse = 0;
+            if (state === 'ready' && on) {
+                const segs = data.segments, beats = data.beats ?? [];
+                segIdx = indexAt(segs, t, segIdx);
+                if (segIdx >= 0) {
+                    const seg = segs[segIdx], next = segs[segIdx + 1];
+                    target = dbToLevel(loudnessAt(seg, next, t));
+                    const p = pitchesAt(seg, next, t);
+                    pitches = pitches.map((v, i) => ease(v, p[i], dt, 0.12));
+                }
+                beatIdx = indexAt(beats, t, beatIdx);
+                pulse = beatPulse(beats[beatIdx], t);
+            }
+            level = ease(level, target, dt, 0.08);
+            phase += dt * (0.6 + 2 * level);
+
+            const W = canvas.width, H = canvas.height;
+            if (W && H) {
+                ctx.clearRect(0, 0, W, H);
+                if (state === 'ready') {
+                    if (style === 'scroll') drawScroll(W, H, t); else drawWave(W, H, pulse);
+                }
+            }
+            lastDrawnT = t;
+            // Paused (or nothing to show): stop once the wave has settled.
+            // Housekeeping restarts it if anything changes.
+            const settled = !on && (style === 'scroll' || level < 0.002);
+            if (!settled && state === 'ready' && W && H) raf = requestAnimationFrame(frame);
+            else lastFrame = 0;
+        }
+
+        function wake() {
+            if (canvas && !raf) raf = requestAnimationFrame(frame);
+        }
+
+        const onSong = () => { load(); wake(); };
+        const onPlayPause = () => wake();
+
+        function mount(el) {
+            unmount();
+            content = el;
+            canvas = document.createElement('canvas');
+            ctx = canvas.getContext('2d');
+            msg = document.createElement('div');
+            msg.className = 'henge-view-msg';
+            content.append(canvas, msg);
+            readColours();
+            resizeObs = new ResizeObserver(() => { fitCanvas(); wake(); });
+            resizeObs.observe(content);
+            fitCanvas();
+            Spicetify.Player?.addEventListener?.('songchange', onSong);
+            Spicetify.Player?.addEventListener?.('onplaypause', onPlayPause);
+            // Theme colours can change live (Marketplace), and a seek while
+            // paused fires no event: check both now and then.
+            housekeeping = setInterval(() => {
+                const recoloured = readColours();
+                if (recoloured || playing() || Math.abs(progress() - lastDrawnT) > 0.05) wake();
+            }, 1000);
+            load();
+            wake();
+        }
+
+        function unmount() {
+            if (!canvas) return;
+            cancelAnimationFrame(raf);
+            raf = 0;
+            lastFrame = 0;
+            clearInterval(housekeeping);
+            resizeObs?.disconnect();
+            Spicetify.Player?.removeEventListener?.('songchange', onSong);
+            Spicetify.Player?.removeEventListener?.('onplaypause', onPlayPause);
+            canvas.remove();
+            msg.remove();
+            content = canvas = ctx = msg = resizeObs = housekeeping = null;
+            token++;
+            level = 0;
+        }
+
+        function setStyle(next) {
+            if (!Object.hasOwn(VIS_STYLES, next)) return;
+            style = next;
+            lsSet(LS_VIS_STYLE, next);
+            wake();
+        }
+
+        const info = () => ({
+            mounted: !!canvas, style, state, error, uri,
+            segments: data?.segments?.length ?? null,
+            beats: data?.beats?.length ?? null,
+            canvas: canvas ? [canvas.width, canvas.height] : null,
+            running: !!raf, colours, cached: cache.size,
+        });
+
+        return { mount, unmount, setStyle, info, get style() { return style; } };
+    })();
 
     // ── Watching Spotify ──────────────────────────────────────────────────────
     // Targeted observers on the library (its class and inline width change with
@@ -1414,15 +1797,36 @@ html.henge-on.henge-resizing .henge-handle {
             }
         }
         select.prepend(...Object.values(groups));
+        return pickerSelect(select, value => setLayout(withSource(layout, slot, value)));
+    }
+
+    // A picker dropdown: auto-close waits while its list is open.
+    function pickerSelect(select, onChange) {
         select.addEventListener('mousedown', () => { choosing = true; clearTimeout(lingerTimer); });
         select.addEventListener('blur', () => { choosing = false; armAutoClose(); });
         select.addEventListener('change', () => {
             choosing = false;
-            setLayout(withSource(layout, slot, select.value));
+            onChange(select.value);
             renderPicker();
             armAutoClose();
         });
         return select;
+    }
+
+    // Shown while the visualiser is placed.
+    function visualiserRow() {
+        const row = document.createElement('label');
+        row.className = 'henge-picker-row';
+        const name = document.createElement('span');
+        name.textContent = 'Visualiser style';
+        const select = document.createElement('select');
+        for (const [value, label] of Object.entries(VIS_STYLES)) {
+            select.append(Object.assign(document.createElement('option'), {
+                value, textContent: label, selected: value === visualiser.style,
+            }));
+        }
+        row.append(name, pickerSelect(select, value => visualiser.setStyle(value)));
+        return row;
     }
 
     function renderPicker() {
@@ -1451,6 +1855,7 @@ html.henge-on.henge-resizing .henge-handle {
             map.append(box);
         }
         picker.append(map);
+        if (slotOf(layout, 'visualiser')) picker.append(visualiserRow());
 
         const foot = document.createElement('div');
         foot.className = 'henge-picker-foot';
@@ -1678,6 +2083,7 @@ html.henge-on.henge-resizing .henge-handle {
                 viewHeight: Math.round(v.el.getBoundingClientRect().height),
                 scrollers: scrollersIn(v.el),
             }])),
+            visualiser: visualiser.info(),
         });
     }
 
