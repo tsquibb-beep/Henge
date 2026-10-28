@@ -15,7 +15,7 @@
 (async () => {
     // Keep in sync with version.txt (the single source of truth). version.txt
     // can't be read at runtime — there's no build step — so it's mirrored here.
-    const VERSION = '1.0.3';
+    const VERSION = '1.0.4';
 
     // One copy only. Installed both from Marketplace and in Spicetify's
     // Extensions folder, two copies would load; claim the slot before the
@@ -265,15 +265,16 @@ html.henge-on #henge-view-lyrics {
    sized to the window (height: calc(100vh - 73px)), so in a shorter view the
    message sat below the bottom edge. While one shows, size the page to the
    view instead. The message's text is sized for the window width too; scale
-   it to the view's. Classes from Spotify 1.3.3 (message, message text,
+   it to the view's. Spotify's hashed classes change between versions, so each
+   list holds the 1.3.6 class, then the 1.3.3 one (message, message text,
    spinner). */
-html.henge-on #henge-view-lyrics .henge-view-content :has(.lzSRPoTbAKaWG_T2CDlK, .fPIOq6k3nkToIHbUnayO) {
+html.henge-on #henge-view-lyrics .henge-view-content :has(.XJwa_tmi0vV5R8tuyhvS, .FeJPf6Jbrnf5iLPPmIAx, .lzSRPoTbAKaWG_T2CDlK, .fPIOq6k3nkToIHbUnayO) {
     height: 100% !important;
 }
-html.henge-on #henge-view-lyrics .lzSRPoTbAKaWG_T2CDlK {
+html.henge-on #henge-view-lyrics :is(.XJwa_tmi0vV5R8tuyhvS, .lzSRPoTbAKaWG_T2CDlK) {
     container-type: inline-size;
 }
-html.henge-on #henge-view-lyrics .bfuVjuVXkeriMvFjcZMD {
+html.henge-on #henge-view-lyrics :is(.nqoWPf1ClF5kduiIPoYH, .bfuVjuVXkeriMvFjcZMD) {
     margin-inline: 8cqi;
     font-size: clamp(1.5rem, 5.5cqi, 4.5rem);
     line-height: 1.2;
