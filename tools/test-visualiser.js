@@ -8,9 +8,9 @@ const src = fs.readFileSync(require('path').join(__dirname, '..', 'henge.js'), '
 const start = src.indexOf('    // ── Visualiser maths');
 const end = src.indexOf('    // ── Visualiser view');
 if (start < 0 || end < start) throw new Error('visualiser markers not found in henge.js');
-const code = `${src.slice(start, end)}\nmodule.exports={indexAt, loudnessAt, dbToLevel, beatPulse, pitchesAt, catmull, chromaAt, ease, isTrackUri, VIS_DB_FLOOR, spread, prepareTrack, brightness, sectionEnergy, parseColour, rgbToHsl, hslToRgb, adjustColour, themePalette, albumPalette};`;
+const code = `${src.slice(start, end)}\nmodule.exports={indexAt, loudnessAt, dbToLevel, beatPulse, pitchesAt, catmull, chromaAt, ease, isTrackUri, VIS_DB_FLOOR, spread, prepareTrack, brightness, sectionEnergy, parseColour, rgbToHsl, hslToRgb, adjustColour, themePalette, albumPalette, hash2, noise2, attackOf, swatchesFromExtracted};`;
 const m = {}; new Function('module', code)(m);
-const { indexAt, loudnessAt, dbToLevel, beatPulse, pitchesAt, catmull, chromaAt, ease, isTrackUri, VIS_DB_FLOOR, spread, prepareTrack, brightness, sectionEnergy, parseColour, rgbToHsl, hslToRgb, adjustColour, themePalette, albumPalette } = m.exports;
+const { indexAt, loudnessAt, dbToLevel, beatPulse, pitchesAt, catmull, chromaAt, ease, isTrackUri, VIS_DB_FLOOR, spread, prepareTrack, brightness, sectionEnergy, parseColour, rgbToHsl, hslToRgb, adjustColour, themePalette, albumPalette, hash2, noise2, attackOf, swatchesFromExtracted } = m.exports;
 
 let pass = 0, fail = 0;
 const near = (a, b, eps = 1e-6) => Math.abs(a - b) <= eps;
@@ -147,6 +147,32 @@ check('album palette lifted', ap && rgbToHsl(ap.a)[2] >= 0.49 && rgbToHsl(ap.b)[
 check('album palette prefers non-alarming', same(albumPalette({ VIBRANT: '#ff0000', VIBRANT_NON_ALARMING: '#2080c0' }).a, adjustColour([32, 128, 192], { minL: 0.5 })));
 check('album palette missing', albumPalette(null) === null && albumPalette({ DARK_VIBRANT: '#101010' }) === null);
 check('album palette only vibrant', !!albumPalette({ VIBRANT: '#2080c0' })?.b);
+
+// noise
+let inRange = true, smooth = true;
+for (let i = 0; i < 2000; i++) {
+    const x = (i * 0.731) % 40 - 20, y = (i * 0.377) % 30 - 15, v = noise2(x, y);
+    if (!(v >= 0 && v <= 1)) inRange = false;
+    if (Math.abs(noise2(x + 0.001, y) - v) > 0.01) smooth = false;
+}
+check('noise in 0..1 (incl. negative coords)', inRange);
+check('noise continuous', smooth);
+check('noise at lattice = hash', near(noise2(3, -4), hash2(3, -4)));
+check('hash deterministic and varied', hash2(5, 7) === hash2(5, 7) && hash2(5, 7) !== hash2(7, 5));
+
+// attackOf
+check('attack sharp', near(attackOf({ loudness_start: -30, loudness_max: -12, confidence: 1 }), 1));
+check('attack none', attackOf({ loudness_start: -10, loudness_max: -10, confidence: 1 }) === 0);
+check('attack scaled by confidence', near(attackOf({ loudness_start: -30, loudness_max: -12, confidence: 0.25 }), 0.5));
+check('attack without confidence', near(attackOf({ loudness_start: -20, loudness_max: -11 }), 0.5));
+
+// swatchesFromExtracted (Spotify's fetchExtractedColors)
+const ex = { __typename: 'ExtractedColors', colorRaw: { hex: '#C02010', isFallback: false }, colorDark: { hex: '#300808', isFallback: false }, colorLight: { hex: '#F0C0B0', isFallback: false } };
+const sw = swatchesFromExtracted(ex);
+check('extracted -> swatches', sw && sw.VIBRANT === '#C02010' && sw.DARK_VIBRANT === '#300808' && sw.LIGHT_VIBRANT === '#F0C0B0');
+check('extracted -> album palette', !!albumPalette(sw));
+check('extracted all fallback -> null', swatchesFromExtracted({ ...ex, colorRaw: { hex: '#535353', isFallback: true }, colorDark: { hex: '#000', isFallback: true }, colorLight: { hex: '#fff', isFallback: true } }) === null);
+check('extracted wrong type / missing', swatchesFromExtracted({ __typename: 'NotFound' }) === null && swatchesFromExtracted(null) === null);
 
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

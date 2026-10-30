@@ -304,7 +304,8 @@ html.henge-on .henge-view-after {
     font-size: 14px;
     text-align: center;
 }
-/* The visualiser's canvas fills the view; its messages sit over it. */
+/* The visualiser's canvases (the wave, then grain and flashes) fill the
+   view; its messages sit over them. */
 html.henge-on #henge-view-visualiser canvas {
     position: absolute;
     inset: 0;
@@ -1445,29 +1446,62 @@ html.henge-on.henge-resizing .henge-handle {
         };
     }
 
+
+    // Smooth value noise in 0…1 from a hashed integer lattice.
+    function hash2(x, y) {
+        let h = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263)) | 0;
+        h = Math.imul(h ^ (h >>> 13), 1274126177);
+        return ((h ^ (h >>> 16)) >>> 0) / 4294967295;
+    }
+
+    function noise2(x, y) {
+        const xi = Math.floor(x), yi = Math.floor(y), xf = x - xi, yf = y - yi;
+        const sx = xf * xf * (3 - 2 * xf), sy = yf * yf * (3 - 2 * yf);
+        const top = lerp(hash2(xi, yi), hash2(xi + 1, yi), sx);
+        const bottom = lerp(hash2(xi, yi + 1), hash2(xi + 1, yi + 1), sx);
+        return lerp(top, bottom, sy);
+    }
+
+    // How hard a segment hits, 0…1: its rise to peak, trusted as far as
+    // the analysis is confident there's a new sound.
+    const attackOf = seg => clamp01((seg.loudness_max - seg.loudness_start) / 18) * Math.sqrt(clamp01(seg.confidence ?? 1));
+
+    // Spotify's extracted cover colours (fetchExtractedColors: raw, dark,
+    // light) as swatches albumPalette() reads; null if all are fallbacks.
+    function swatchesFromExtracted(e) {
+        if (!e || (e.__typename && e.__typename !== 'ExtractedColors')) return null;
+        const all = [e.colorRaw, e.colorDark, e.colorLight];
+        if (all.every(c => !c?.hex || c.isFallback)) return null;
+        return { VIBRANT: e.colorRaw?.hex, DARK_VIBRANT: e.colorDark?.hex, LIGHT_VIBRANT: e.colorLight?.hex };
+    }
+
     // ── Visualiser view ──
 
     const visualiser = (() => {
-        const MAX_PIXELS = 1.6e6;   // canvas resolution cap: glow is costly
+        const MAX_PIXELS = 1.6e6;     // main canvas resolution cap
+        const MAX_PARTICLES = 1400;
         const savedOr = (key, options, fallback) => {
             const v = lsGet(key);
             return Object.hasOwn(options, v ?? '') ? v : fallback;
         };
-        let content = null, canvas = null, ctx = null, msg = null, resizeObs = null, housekeeping = null;
+        let content = null, canvas = null, ctx = null, fx = null, fxCtx = null, msg = null;
+        let resizeObs = null, housekeeping = null, needsFit = true;
         let style = savedOr(LS_VIS_STYLE, VIS_STYLES, 'mirror');
         let colourMode = savedOr(LS_VIS_COLOURS, VIS_COLOURS, 'theme');
         let theme = {};                     // --spice-* colour strings
         const cache = new Map();            // uri → prepared track (or null), the last few
         const swatchCache = new Map();      // uri → album colour swatches (or null)
         let uri = null, track = null, state = 'idle', error = null, token = 0;
-        let swatches = null, cover = null;
+        let swatches = null, swatchSource = null, swatchError = null, cover = null, coverReady = false;
         let raf = 0, lastFrame = 0, lastDrawnT = -1, scale = 1, wipe = true;
-        // Animated values, eased every frame.
-        let level = 0, edge = 0.5, energy = 0.6, bloom = 0, downbeat = 0, pulse = 0, phase = 0, spin = 0;
+        // Animated values, eased every frame. kick: the last segment's hit;
+        // heat: how intense things are overall, which most effects follow.
+        let level = 0, edge = 0.5, energy = 0.6, bloom = 0, downbeat = 0, pulse = 0, kick = 0, heat = 0;
+        let phase = 0, spin = 0, clock = 0, intro = 0;
         let segIdx = -1, beatIdx = -1, barIdx = -1, secIdx = -1;
         let pitches = new Array(12).fill(0);
         let palette = null, goal = null;    // { a, b, c } as [r, g, b]; palette fades to goal
-        let particles = [];
+        let particles = [], shocks = [], bolts = [], grain = null;
 
         const MESSAGES = {
             idle: 'Play a song to see the visualiser.',
@@ -1523,10 +1557,43 @@ html.henge-on.henge-resizing .henge-handle {
                 `https://spclient.wg.spotify.com/audio-attributes/v1/audio-analysis/${u.split(':')[2]}?format=json`);
         }
 
-        // Album colours, only fetched in album mode. The old colours stay
-        // until the new ones arrive, so a song change is one crossfade.
+        // The cover's spotify:image: URI, and its https URL.
+        function coverUri() {
+            const m = Spicetify.Player?.data?.item?.metadata ?? {};
+            return m.image_xlarge_url || m.image_large_url || m.image_url || '';
+        }
+        function coverUrl() {
+            const u = coverUri();
+            if (u.startsWith('spotify:image:')) return `https://i.scdn.co/image/${u.slice(14)}`;
+            return u.startsWith('https:') ? u : null;
+        }
+
+        // Album colours: Spotify's own extraction (the GraphQL query its
+        // Now Playing view uses), else Spicetify's older colorExtractor.
+        async function fetchSwatches(u, image) {
+            const G = Spicetify.GraphQL, def = G?.Definitions?.fetchExtractedColors;
+            swatchError = null;
+            if (image.startsWith('spotify:image:') && def && G.Request) {
+                try {
+                    const res = await G.Request(def, { imageUris: [image] });
+                    const sw = swatchesFromExtracted(res?.data?.extractedColors?.[0]);
+                    if (sw) { swatchSource = 'fetchExtractedColors'; return sw; }
+                } catch (e) { swatchError = `fetchExtractedColors: ${e?.message ?? e}`; }
+            }
+            if (Spicetify.colorExtractor) {
+                try {
+                    const sw = await Spicetify.colorExtractor(u);
+                    if (albumPalette(sw)) { swatchSource = 'colorExtractor'; return sw; }
+                } catch (e) { swatchError = `colorExtractor: ${e?.message ?? e}`; }
+            }
+            swatchSource = null;
+            return null;
+        }
+
+        // Only fetched in album mode. The old colours stay until the new ones
+        // arrive, so a song change is one crossfade.
         function loadSwatches(mine) {
-            if (colourMode !== 'album' || !uri || !Spicetify.colorExtractor) {
+            if (colourMode !== 'album' || !uri) {
                 swatches = null;
                 return retarget();
             }
@@ -1535,28 +1602,24 @@ html.henge-on.henge-resizing .henge-handle {
                 return retarget();
             }
             const u = uri;
-            Spicetify.colorExtractor(u).catch(() => null).then(sw => {
+            fetchSwatches(u, coverUri()).then(sw => {
                 remember(swatchCache, u, sw);
                 if (mine === token) { swatches = sw; retarget(); }
             });
         }
 
-        function coverUrl() {
-            const m = Spicetify.Player?.data?.item?.metadata ?? {};
-            const u = m.image_xlarge_url || m.image_large_url || m.image_url || '';
-            if (u.startsWith('spotify:image:')) return `https://i.scdn.co/image/${u.slice(14)}`;
-            return u.startsWith('https:') ? u : null;
-        }
-
+        // Decoded off the main thread before first use, so drawing it
+        // doesn't stall a frame.
         function loadCover() {
             const url = coverUrl();
             if (cover?.src === url) return;
             cover = null;
+            coverReady = false;
             if (!url) return;
             const img = new Image();
-            img.onload = () => wake();
             img.src = url;
             cover = img;
+            img.decode().then(() => { if (cover === img) { coverReady = true; wake(); } }, () => {});
         }
 
         // Loads the current track's analysis; a later call wins over a slow one.
@@ -1589,14 +1652,21 @@ html.henge-on.henge-resizing .henge-handle {
             wake();
         }
 
+        // Done in the next frame rather than on every resize notification:
+        // resizing a canvas reallocates it.
         function fitCanvas() {
+            needsFit = false;
             const cw = content.clientWidth, ch = content.clientHeight;
             scale = Math.min(window.devicePixelRatio || 1, Math.sqrt(MAX_PIXELS / Math.max(1, cw * ch)));
             const w = Math.round(cw * scale), h = Math.round(ch * scale);
             if (canvas.width !== w || canvas.height !== h) {
                 canvas.width = w;
                 canvas.height = h;
+                particles = []; shocks = []; bolts = [];
             }
+            // Grain and flashes don't need full resolution.
+            const fw = Math.round(cw * Math.min(1, scale)), fh = Math.round(ch * Math.min(1, scale));
+            if (fx.width !== fw || fx.height !== fh) { fx.width = fw; fx.height = fh; }
         }
 
         // getProgress() throws before anything has played (no player state).
@@ -1604,46 +1674,84 @@ html.henge-on.henge-resizing .henge-handle {
             try { return (Spicetify.Player?.getProgress?.() ?? 0) / 1000; } catch { return 0; }
         };
         const playing = () => !!Spicetify.Player?.isPlaying?.();
+        const random = (lo, hi) => lo + Math.random() * (hi - lo);
 
         // Back to front. The back layers come in as a section gets louder.
         const layers = () => [
-            { k: 1.15, speed: 0.55, offset: 4, alpha: 0.06 + 0.18 * energy, colour: palette.b },
-            { k: 0.85, speed: 1.4, offset: 8, alpha: 0.08 + 0.16 * energy, colour: palette.c },
+            { k: 1.2, speed: 0.55, offset: 4, alpha: 0.06 + 0.2 * energy, colour: palette.b },
+            { k: 0.85, speed: 1.5, offset: 8, alpha: 0.08 + 0.18 * energy, colour: palette.c },
             { k: 1, speed: 1, offset: 0, alpha: 1, colour: palette.a, front: true },
         ];
 
         // Height (0…1) of a wave layer at x (0…1): the level, shaped by the
-        // pitch curve drifting across. Brighter sounds give narrower peaks
-        // and a fine ripple; louder sections and downbeats lift it. `taper`
-        // brings it to nothing at the ends (the ring wraps instead).
+        // pitch curve drifting across, roughened by noise that turns into a
+        // crackle on hard hits. `taper` brings it to nothing at the ends
+        // (the ring wraps instead).
         function amplitude(x, layer, taper) {
             const u = ((x * 12 + phase * layer.speed + layer.offset) % 12 + 12) % 12;
             const c = clamp01(chromaAt(pitches, u));
-            const shape = 0.3 + 0.7 * c ** (1 + 2 * edge)
-                + 0.1 * edge * Math.sin(2 * Math.PI * 9 * x + phase * 3 * layer.speed);
-            const lift = (0.75 + 0.35 * energy) * (1 + 0.28 * downbeat + 0.12 * pulse + 0.2 * bloom);
-            const a = level * shape * lift * layer.k * (taper ? Math.sin(Math.PI * x) ** 0.8 : 1);
-            return clamp01(a);
+            const shape = 0.25 + 0.75 * c ** (1 + 3 * edge);
+            const wobble = noise2(x * 14 + layer.offset * 5, clock * (4 + 6 * kick)) - 0.5;
+            const crackle = noise2(x * 80 + layer.offset * 11, clock * 30) - 0.5;
+            const rough = 1 + (0.35 + 1.1 * kick + 0.4 * edge) * wobble + (0.15 + 0.9 * kick) * (0.4 + edge) * crackle;
+            const lift = (0.7 + 0.45 * energy) * (1 + 0.35 * downbeat + 0.15 * pulse + 0.25 * bloom + 0.6 * kick);
+            const end = taper ? Math.sin(Math.PI * x) ** 0.6 : 1;
+            return clamp01(level * intro * shape * lift * layer.k * rough * end);
         }
 
-        function glow(colour) {
-            ctx.shadowColor = rgba(colour, 0.9);
-            ctx.shadowBlur = (6 + 14 * downbeat + 18 * bloom) * scale;
+        // A hot edge: wide soft passes added on top, then a bright core.
+        function glowStroke(colour, core = 2) {
+            ctx.lineJoin = 'round';
+            ctx.globalCompositeOperation = 'lighter';
+            ctx.strokeStyle = rgba(colour, 0.05 + 0.1 * heat);
+            ctx.lineWidth = (12 + 14 * downbeat + 10 * kick) * scale;
+            ctx.stroke();
+            ctx.strokeStyle = rgba(colour, 0.18);
+            ctx.lineWidth = 5 * scale;
+            ctx.stroke();
+            ctx.globalCompositeOperation = 'source-over';
+            ctx.strokeStyle = rgba(mixRgb(colour, [255, 255, 255], 0.35 + 0.4 * kick), 1);
+            ctx.lineWidth = core * scale;
+            ctx.stroke();
         }
+
+        // Hard hits split the edge into red and cyan ghosts.
+        function split(path, colour) {
+            const off = (kick * 7 + bloom * 5) * scale;
+            if (off < 0.8 * scale) return;
+            ctx.globalCompositeOperation = 'lighter';
+            ctx.lineWidth = 1.5 * scale;
+            for (const [dx, tint] of [[-off, [255, 40, 90]], [off, [40, 220, 255]]]) {
+                ctx.save();
+                ctx.translate(dx, 0);
+                path();
+                ctx.strokeStyle = rgba(mixRgb(colour, tint, 0.6), 0.6 * Math.min(1, kick + bloom));
+                ctx.stroke();
+                ctx.restore();
+            }
+            ctx.globalCompositeOperation = 'source-over';
+        }
+
+        // Each wave style draws itself and returns its geometry for the
+        // effects: where sparks leave from (crest), how they're pulled
+        // (accel), the shape of a shockwave, and a size to scale speeds by.
 
         function drawMirror(W, H) {
-            const mid = H / 2, max = mid - 6 * scale;
-            const n = Math.max(2, Math.min(240, Math.round(W / (4 * scale))));
-            // The centre line brightens on downbeats.
-            ctx.fillStyle = rgba(palette.c, 0.15 + 0.5 * downbeat);
+            const mid = H / 2, max = mid - 8 * scale;
+            const n = Math.max(2, Math.min(260, Math.round(W / (3 * scale))));
+            ctx.fillStyle = rgba(palette.c, 0.12 + 0.5 * downbeat + 0.3 * kick);
             ctx.fillRect(0, mid - scale / 2, W, scale);
+            let front = null;
             for (const layer of layers()) {
                 const amps = Array.from({ length: n + 1 }, (_, i) => amplitude(i / n, layer, true));
-                ctx.beginPath();
-                ctx.moveTo(0, mid);
-                for (let i = 1; i <= n; i++) ctx.lineTo(i / n * W, mid - amps[i] * max);
-                for (let i = n; i >= 0; i--) ctx.lineTo(i / n * W, mid + amps[i] * max);
-                ctx.closePath();
+                const outline = () => {
+                    ctx.beginPath();
+                    ctx.moveTo(0, mid);
+                    for (let i = 1; i <= n; i++) ctx.lineTo(i / n * W, mid - amps[i] * max);
+                    for (let i = n; i >= 0; i--) ctx.lineTo(i / n * W, mid + amps[i] * max);
+                    ctx.closePath();
+                };
+                outline();
                 if (!layer.front) {
                     ctx.fillStyle = rgba(layer.colour, layer.alpha);
                     ctx.fill();
@@ -1651,29 +1759,45 @@ html.henge-on.henge-resizing .henge-handle {
                 }
                 const g = ctx.createLinearGradient(0, mid - max, 0, mid + max);
                 g.addColorStop(0, rgba(layer.colour, 0.03));
-                g.addColorStop(0.5, rgba(layer.colour, 0.45 + 0.2 * downbeat));
+                g.addColorStop(0.5, rgba(layer.colour, 0.45 + 0.25 * downbeat + 0.2 * kick));
                 g.addColorStop(1, rgba(layer.colour, 0.03));
                 ctx.fillStyle = g;
                 ctx.fill();
-                glow(layer.colour);
-                ctx.strokeStyle = rgba(mixRgb(layer.colour, palette.c, 0.3), 1);
-                ctx.lineWidth = 2 * scale;
-                ctx.stroke();
-                ctx.shadowBlur = 0;
+                glowStroke(layer.colour);
+                split(outline, layer.colour);
+                front = amps;
             }
+            return {
+                size: H,
+                crest() {
+                    let i = 0, best = -1;
+                    for (let k = 0; k < 3; k++) {
+                        const j = Math.floor(Math.random() * (n + 1));
+                        if (front[j] > best) { best = front[j]; i = j; }
+                    }
+                    const up = Math.random() < 0.5 ? -1 : 1;
+                    return { x: i / n * W, y: mid + up * front[i] * max, nx: 0, ny: up };
+                },
+                // Sparks are pulled back towards the centre line; embers drift out.
+                accel: p => [0, (p.y < mid ? 1 : -1) * (p.ember ? -0.12 : 1.1) * H],
+                shock(f) {
+                    ctx.beginPath();
+                    ctx.ellipse(W / 2, mid, Math.max(1, f * W * 0.55), Math.max(1, f * H * 0.65), 0, 0, 2 * Math.PI);
+                },
+            };
         }
 
         // The wave wrapped into a ring around the album cover, which turns
-        // slowly while the song plays. Particles burst out on downbeats.
-        function drawRadial(W, H, dt) {
+        // slowly while the song plays.
+        function drawRadial(W, H) {
             const cx = W / 2, cy = H / 2, m = Math.min(W, H);
-            const R = m * 0.27, span = m * 0.2, n = 200;
-            const r = R * 0.8 * (1 + 0.035 * downbeat);
+            const R = m * 0.27, span = m * 0.2, n = 220;
+            const r = R * 0.8 * (1 + 0.035 * downbeat + 0.05 * kick);
             ctx.save();
             ctx.beginPath();
             ctx.arc(cx, cy, r, 0, 2 * Math.PI);
             ctx.clip();
-            if (cover?.complete && cover.naturalWidth) {
+            if (coverReady) {
                 ctx.translate(cx, cy);
                 ctx.rotate(spin);
                 ctx.drawImage(cover, -r, -r, 2 * r, 2 * r);
@@ -1688,14 +1812,18 @@ html.henge-on.henge-resizing .henge-handle {
             ctx.arc(cx, cy, r + 2 * scale, 0, 2 * Math.PI);
             ctx.stroke();
 
+            const point = (i, rad) => {
+                const th = i / n * 2 * Math.PI - Math.PI / 2;
+                return [cx + Math.cos(th) * rad, cy + Math.sin(th) * rad, Math.cos(th), Math.sin(th)];
+            };
             const ring = (amps, radius) => {
                 amps.forEach((a, i) => {
-                    const th = i / n * 2 * Math.PI - Math.PI / 2, rad = radius(a);
-                    const x = cx + Math.cos(th) * rad, y = cy + Math.sin(th) * rad;
+                    const [x, y] = point(i, radius(a));
                     if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
                 });
                 ctx.closePath();
             };
+            let front = null;
             for (const layer of layers()) {
                 const amps = Array.from({ length: n }, (_, i) => amplitude(i / n, layer, false));
                 ctx.beginPath();
@@ -1708,59 +1836,72 @@ html.henge-on.henge-resizing .henge-handle {
                 }
                 const g = ctx.createRadialGradient(cx, cy, R - span * 0.25, cx, cy, R + span);
                 g.addColorStop(0, rgba(layer.colour, 0.3));
-                g.addColorStop(0.2, rgba(layer.colour, 0.5 + 0.2 * downbeat));
+                g.addColorStop(0.2, rgba(layer.colour, 0.5 + 0.25 * downbeat + 0.2 * kick));
                 g.addColorStop(1, rgba(layer.colour, 0.03));
                 ctx.fillStyle = g;
                 ctx.fill('evenodd');
-                ctx.beginPath();
-                ring(amps, a => R + a * span);
-                glow(layer.colour);
-                ctx.strokeStyle = rgba(mixRgb(layer.colour, palette.c, 0.3), 1);
-                ctx.lineWidth = 2 * scale;
-                ctx.stroke();
-                ctx.shadowBlur = 0;
+                const outer = () => { ctx.beginPath(); ring(amps, a => R + a * span); };
+                outer();
+                glowStroke(layer.colour);
+                split(outer, layer.colour);
+                front = amps;
             }
-
-            // Particles live in units of the panel's smaller side.
-            particles = particles.filter(p => (p.life -= dt / 1.6) > 0);
-            for (const p of particles) {
-                p.r += p.v * dt;
-                ctx.fillStyle = rgba(palette.c, 0.85 * p.life);
-                ctx.beginPath();
-                ctx.arc(cx + Math.cos(p.th) * p.r * m, cy + Math.sin(p.th) * p.r * m, (1 + 2 * p.life) * scale, 0, 2 * Math.PI);
-                ctx.fill();
-            }
-        }
-
-        function emit(count, speed) {
-            for (let i = 0; i < count && particles.length < 260; i++) {
-                particles.push({ th: Math.random() * 2 * Math.PI, r: 0.27 + 0.2 * level, v: speed * (0.5 + Math.random()), life: 1 });
-            }
+            return {
+                size: m,
+                crest() {
+                    const i = Math.floor(Math.random() * n);
+                    const [x, y, nx, ny] = point(i, R + front[i] * span);
+                    return { x, y, nx, ny };
+                },
+                // Sparks fly free; embers swirl round the ring.
+                accel: p => {
+                    if (!p.ember) return [0, 0];
+                    const dx = p.x - cx, dy = p.y - cy, d = Math.hypot(dx, dy) || 1;
+                    return [(-dy / d * 0.25 + dx / d * 0.05) * m, (dx / d * 0.25 + dy / d * 0.05) * m];
+                },
+                shock(f) {
+                    ctx.beginPath();
+                    ctx.arc(cx, cy, R + f * m * 0.7, 0, 2 * Math.PI);
+                },
+            };
         }
 
         // An oscilloscope trace under the wave's envelope, with a fainter
         // echo behind it.
         function drawLine(W, H) {
-            const mid = H / 2, max = mid - 6 * scale;
-            const n = Math.max(2, Math.min(240, Math.round(W / (4 * scale))));
-            const trace = (layer, cycles, shift) => {
+            const mid = H / 2, max = mid - 8 * scale;
+            const n = Math.max(2, Math.min(260, Math.round(W / (3 * scale))));
+            const ys = (layer, cycles, shift) => Array.from({ length: n + 1 }, (_, i) => {
+                const x = i / n;
+                return mid - amplitude(x, layer, true) * max * Math.sin(2 * Math.PI * cycles * x - phase * 2.5 * layer.speed + shift);
+            });
+            const path = pts => () => {
                 ctx.beginPath();
-                for (let i = 0; i <= n; i++) {
-                    const x = i / n;
-                    const y = mid - amplitude(x, layer, true) * max * Math.sin(2 * Math.PI * cycles * x - phase * 2.5 * layer.speed + shift);
-                    if (i) ctx.lineTo(x * W, y); else ctx.moveTo(0, y);
-                }
-                ctx.stroke();
+                pts.forEach((y, i) => { if (i) ctx.lineTo(i / n * W, y); else ctx.moveTo(0, y); });
             };
-            const [back, , front] = layers();
+            const [back, , frontLayer] = layers();
+            const echo = path(ys(back, 3, 1.3));
+            echo();
             ctx.strokeStyle = rgba(palette.b, 0.55);
             ctx.lineWidth = 1.5 * scale;
-            trace(back, 3, 1.3);
-            glow(palette.a);
-            ctx.strokeStyle = rgba(mixRgb(palette.a, palette.c, 0.2), 1);
-            ctx.lineWidth = 2 * scale;
-            trace(front, 4, 0);
-            ctx.shadowBlur = 0;
+            ctx.stroke();
+            const front = ys(frontLayer, 4, 0);
+            const trace = path(front);
+            trace();
+            glowStroke(palette.a);
+            split(trace, palette.a);
+            return {
+                size: H,
+                crest() {
+                    const i = Math.floor(Math.random() * (n + 1));
+                    return { x: i / n * W, y: front[i], nx: 0, ny: front[i] < mid ? -1 : 1 };
+                },
+                accel: p => [0, (p.y < mid ? 1 : -1) * (p.ember ? -0.12 : 1.1) * H],
+                shock(f) {
+                    ctx.beginPath();
+                    ctx.ellipse(W / 2, mid, Math.max(1, f * W * 0.55), Math.max(1, f * H * 0.65), 0, 0, 2 * Math.PI);
+                },
+            };
         }
 
         // The track's loudness as bars scrolling past a centre "now" marker.
@@ -1787,46 +1928,195 @@ html.henge-on.henge-resizing .henge-handle {
             ctx.globalAlpha = 1;
         }
 
+        // A jagged bolt from the crest outwards, gone in a fraction of a second.
+        function bolt(geo) {
+            const c = geo.crest();
+            const len = geo.size * random(0.25, 0.6), steps = 10;
+            let x = c.x, y = c.y;
+            const pts = [[x, y]];
+            for (let i = 0; i < steps; i++) {
+                x += c.nx * len / steps + random(-0.5, 0.5) * len * 0.3;
+                y += c.ny * len / steps + random(-0.5, 0.5) * len * 0.3;
+                pts.push([x, y]);
+            }
+            bolts.push({ pts, life: 1 });
+        }
+
+        // New sparks and embers: a steady stream that grows with the music,
+        // bursts on hits and downbeats, a blast on a new section.
+        function spawn(geo, ev, dt) {
+            let count = Math.floor((20 + 320 * heat) * level * intro * dt + Math.random());
+            if (ev.kick > 0.15) count += Math.round(ev.kick * (12 + 55 * heat));
+            if (ev.downbeat) {
+                count += Math.round(15 + 45 * heat);
+                if (heat > 0.35) shocks.push({ age: 0, power: heat });
+                if (heat > 0.6 && Math.random() < heat) bolt(geo);
+            }
+            if (ev.section) {
+                count += 220;
+                shocks.push({ age: 0, power: 1.4 });
+                bolt(geo); bolt(geo); bolt(geo);
+            }
+            for (let i = 0; i < count && particles.length < MAX_PARTICLES; i++) {
+                const c = geo.crest(), ember = Math.random() < 0.25;
+                const speed = (ember ? random(0.03, 0.1) : random(0.2, 1) * (0.5 + kick + 0.6 * heat)) * geo.size;
+                const turn = random(-0.5, 0.5) * (ember ? 1.4 : 1);
+                const cos = Math.cos(turn), sin = Math.sin(turn);
+                particles.push({
+                    x: c.x, y: c.y, ember, seed: Math.random() * 100, life: 1,
+                    vx: (c.nx * cos - c.ny * sin) * speed, vy: (c.nx * sin + c.ny * cos) * speed,
+                    decay: 1 / (ember ? random(1.2, 2.8) : random(0.3, 0.9)),
+                });
+            }
+        }
+
+        function drawEffects(geo, dt) {
+            ctx.globalCompositeOperation = 'lighter';
+            // Shockwaves: rings expanding out from the wave.
+            shocks = shocks.filter(s => (s.age += dt) < 0.6);
+            for (const s of shocks) {
+                const f = s.age / 0.6;
+                geo.shock(f);
+                ctx.strokeStyle = rgba(palette.c, (1 - f) ** 2 * 0.45 * s.power);
+                ctx.lineWidth = (1 + 4 * (1 - f)) * scale;
+                ctx.stroke();
+            }
+            // Bolts: a coloured halo, then a white-hot core.
+            bolts = bolts.filter(b => (b.life -= dt / 0.18) > 0);
+            for (const b of bolts) {
+                ctx.beginPath();
+                b.pts.forEach(([x, y], i) => { if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y); });
+                ctx.strokeStyle = rgba(palette.a, 0.35 * b.life);
+                ctx.lineWidth = 7 * scale;
+                ctx.stroke();
+                ctx.strokeStyle = rgba(mixRgb(palette.c, [255, 255, 255], 0.7), b.life);
+                ctx.lineWidth = 1.5 * scale;
+                ctx.stroke();
+            }
+            // Particles: move, then draw sparks as streaks in four batches
+            // (white-hot when new, cooling to the palette) and embers as
+            // flickering motes.
+            const drag = Math.exp(-dt * 1.8);
+            particles = particles.filter(p => (p.life -= dt * p.decay) > 0);
+            for (const p of particles) {
+                const [ax, ay] = geo.accel(p);
+                p.vx = (p.vx + ax * dt) * drag;
+                p.vy = (p.vy + ay * dt) * drag;
+                if (p.ember) p.vx += (noise2(p.seed, clock * 2) - 0.5) * geo.size * 0.4 * dt;
+                p.x += p.vx * dt;
+                p.y += p.vy * dt;
+            }
+            for (let band = 0; band < 4; band++) {
+                ctx.beginPath();
+                let any = false;
+                for (const p of particles) {
+                    if (p.ember || Math.min(3, Math.floor(p.life * 4)) !== band) continue;
+                    ctx.moveTo(p.x, p.y);
+                    ctx.lineTo(p.x - p.vx * 0.03, p.y - p.vy * 0.03);
+                    any = true;
+                }
+                if (!any) continue;
+                const f = (band + 0.5) / 4;
+                ctx.strokeStyle = rgba(mixRgb(palette.a, [255, 255, 255], f * 0.85), 0.3 + 0.7 * f);
+                ctx.lineWidth = (0.8 + 1.6 * f) * scale;
+                ctx.stroke();
+            }
+            for (const p of particles) {
+                if (!p.ember) continue;
+                const size = (1 + 2.5 * p.life) * scale;
+                ctx.fillStyle = rgba(palette.c, 0.7 * p.life * (0.4 + 0.6 * noise2(p.seed, clock * 12)));
+                ctx.fillRect(p.x - size / 2, p.y - size / 2, size, size);
+            }
+            ctx.globalCompositeOperation = 'source-over';
+        }
+
+        // Film grain and flashes go on their own canvas above the wave, so
+        // the trails don't smear them.
+        function grainPattern() {
+            if (grain) return grain;
+            const tile = document.createElement('canvas');
+            tile.width = tile.height = 96;
+            const tctx = tile.getContext('2d');
+            const img = tctx.createImageData(96, 96);
+            for (let i = 0; i < img.data.length; i += 4) {
+                const v = Math.random() * 255;
+                img.data[i] = img.data[i + 1] = img.data[i + 2] = v;
+                img.data[i + 3] = Math.random() < 0.55 ? 0 : Math.random() * 255;
+            }
+            tctx.putImageData(img, 0, 0);
+            grain = fxCtx.createPattern(tile, 'repeat');
+            return grain;
+        }
+
+        function drawFx(on) {
+            const W = fx.width, H = fx.height;
+            fxCtx.clearRect(0, 0, W, H);
+            if (!on || state !== 'ready' || style === 'scroll' || !W || !H) return;
+            const flash = 0.09 * downbeat * heat + 0.25 * bloom + 0.06 * kick;
+            if (flash > 0.01) {
+                const g = fxCtx.createRadialGradient(W / 2, H / 2, 0, W / 2, H / 2, Math.max(W, H) * 0.6);
+                g.addColorStop(0, rgba(palette.a, flash));
+                g.addColorStop(1, rgba(palette.a, 0));
+                fxCtx.fillStyle = g;
+                fxCtx.fillRect(0, 0, W, H);
+            }
+            const pattern = grainPattern();
+            if (!pattern) return;
+            fxCtx.save();
+            fxCtx.globalAlpha = 0.05 + 0.07 * heat + 0.1 * kick;
+            fxCtx.translate(-Math.random() * 96, -Math.random() * 96);
+            fxCtx.fillStyle = pattern;
+            fxCtx.fillRect(0, 0, W + 96, H + 96);
+            fxCtx.restore();
+        }
+
         function frame(now) {
             raf = 0;
             if (!canvas) return;
-            const dt = lastFrame ? Math.min(0.1, (now - lastFrame) / 1000) : 0;
+            if (needsFit) fitCanvas();
+            // Capped, so a slow frame doesn't throw everything forwards.
+            const dt = lastFrame ? Math.min(0.05, (now - lastFrame) / 1000) : 0;
             lastFrame = now;
             const t = progress(), on = playing();
             let levelTo = 0, beat = 0, bar = 0, edgeTo = edge, energyTo = energy;
+            // Events only fire as playback moves on, not when seeking.
+            const ev = { kick: 0, downbeat: false, section: false };
             if (state === 'ready' && on) {
                 const segs = track.segments;
+                const prevSeg = segIdx;
                 segIdx = indexAt(segs, t, segIdx);
                 if (segIdx >= 0) {
                     const seg = segs[segIdx], next = segs[segIdx + 1];
                     levelTo = dbToLevel(loudnessAt(seg, next, t));
                     const p = pitchesAt(seg, next, t);
-                    pitches = pitches.map((v, i) => ease(v, p[i], dt, 0.12));
+                    pitches = pitches.map((v, i) => ease(v, p[i], dt, 0.08));
                     edgeTo = brightness(track, seg);
+                    if (segIdx === prevSeg + 1) ev.kick = attackOf(seg);
                 }
                 beatIdx = indexAt(track.beats, t, beatIdx);
                 beat = beatPulse(track.beats[beatIdx], t);
                 const prevBar = barIdx;
                 barIdx = indexAt(track.bars, t, barIdx);
                 bar = beatPulse(track.bars[barIdx], t, 0.25);
-                if (barIdx !== prevBar && barIdx >= 0 && style === 'radial') emit(6 + Math.round(16 * energy), 0.12 + 0.25 * level);
+                ev.downbeat = barIdx >= 0 && barIdx === prevBar + 1;
                 const prevSec = secIdx;
                 secIdx = indexAt(track.sections, t, secIdx);
                 energyTo = sectionEnergy(track, track.sections[secIdx]);
-                // A new section (into the chorus, say) flares.
-                if (secIdx !== prevSec && prevSec >= 0) {
-                    bloom = 1;
-                    if (style === 'radial') emit(40, 0.3);
-                }
-                spin += dt * 2 * Math.PI * 0.1 * (track.tempo / 120);
+                ev.section = secIdx > 0 && secIdx === prevSec + 1;
+                spin += dt * 2 * Math.PI * 0.1 * (track.tempo / 120) + ev.kick * 0.04;
             }
-            level = ease(level, levelTo, dt, 0.08);
-            edge = ease(edge, edgeTo, dt, 0.25);
-            energy = ease(energy, energyTo, dt, 1.2);
-            pulse = ease(pulse, beat, dt, 0.03);
-            downbeat = ease(downbeat, bar, dt, 0.03);
+            level = ease(level, levelTo, dt, 0.05);
+            edge = ease(edge, edgeTo, dt, 0.2);
+            energy = ease(energy, energyTo, dt, 1);
+            pulse = ease(pulse, beat, dt, 0.02);
+            downbeat = ease(downbeat, bar, dt, 0.02);
+            kick = Math.max(kick * Math.exp(-dt / 0.09), ev.kick);
+            if (ev.section) bloom = 1;
             bloom *= Math.exp(-dt / 0.9);
-            phase += dt * (0.6 + 2 * level);
+            intro = state === 'ready' ? Math.min(1, intro + dt / 0.6) : 0;
+            heat = clamp01(0.45 * level + 0.55 * energy + 0.3 * bloom);
+            clock += dt;
+            phase += dt * (0.6 + 2.2 * level + 1.5 * kick);
             const fade = 1 - Math.exp(-dt / 0.5);
             if (palette && goal) palette = { a: mixRgb(palette.a, goal.a, fade), b: mixRgb(palette.b, goal.b, fade), c: mixRgb(palette.c, goal.c, fade) };
 
@@ -1837,23 +2127,33 @@ html.henge-on.henge-resizing .henge-handle {
                 } else {
                     // Trails: fade what's there instead of clearing it.
                     ctx.globalCompositeOperation = 'destination-out';
-                    ctx.fillStyle = `rgba(0, 0, 0, ${1 - Math.exp(-dt / 0.045)})`;
+                    ctx.fillStyle = `rgba(0, 0, 0, ${1 - Math.exp(-dt / 0.07)})`;
                     ctx.fillRect(0, 0, W, H);
                     ctx.globalCompositeOperation = 'source-over';
                 }
                 wipe = false;
                 if (state === 'ready' && palette) {
-                    if (style === 'scroll') drawScroll(W, H, t);
-                    else if (style === 'line') drawLine(W, H);
-                    else if (style === 'radial') drawRadial(W, H, dt);
-                    else drawMirror(W, H);
+                    if (style === 'scroll') {
+                        drawScroll(W, H, t);
+                    } else {
+                        // A shake on downbeats, harder when it's loud.
+                        const shake = (4 * downbeat * heat + 3 * kick * heat) * scale;
+                        ctx.save();
+                        ctx.translate((noise2(clock * 40, 1) - 0.5) * 2 * shake, (noise2(clock * 40, 9) - 0.5) * 2 * shake);
+                        const geo = style === 'radial' ? drawRadial(W, H) : style === 'line' ? drawLine(W, H) : drawMirror(W, H);
+                        if (on) spawn(geo, ev, dt);
+                        drawEffects(geo, dt);
+                        ctx.restore();
+                    }
                 }
+                drawFx(on);
             }
             lastDrawnT = t;
             // Paused (or nothing to show): stop once everything has settled.
             // Housekeeping restarts it if anything changes.
             const fading = palette && goal && ['a', 'b', 'c'].some(k => palette[k].some((v, i) => Math.abs(v - goal[k][i]) > 0.5));
-            const still = style === 'scroll' || (level < 0.002 && bloom < 0.01 && !particles.length);
+            const still = style === 'scroll' || (level < 0.002 && kick < 0.01 && bloom < 0.01
+                && !particles.length && !shocks.length && !bolts.length);
             if ((on || !still || fading) && state === 'ready' && W && H) raf = requestAnimationFrame(frame);
             else lastFrame = 0;
         }
@@ -1870,12 +2170,14 @@ html.henge-on.henge-resizing .henge-handle {
             content = el;
             canvas = document.createElement('canvas');
             ctx = canvas.getContext('2d');
+            fx = document.createElement('canvas');
+            fxCtx = fx.getContext('2d');
             msg = document.createElement('div');
             msg.className = 'henge-view-msg';
-            content.append(canvas, msg);
-            resizeObs = new ResizeObserver(() => { fitCanvas(); wipe = true; wake(); });
+            content.append(canvas, fx, msg);
+            needsFit = true;
+            resizeObs = new ResizeObserver(() => { needsFit = true; wipe = true; wake(); });
             resizeObs.observe(content);
-            fitCanvas();
             Spicetify.Player?.addEventListener?.('songchange', onSong);
             Spicetify.Player?.addEventListener?.('onplaypause', onPlayPause);
             // Theme colours can change live (Marketplace), and a seek while
@@ -1899,18 +2201,19 @@ html.henge-on.henge-resizing .henge-handle {
             Spicetify.Player?.removeEventListener?.('songchange', onSong);
             Spicetify.Player?.removeEventListener?.('onplaypause', onPlayPause);
             canvas.remove();
+            fx.remove();
             msg.remove();
-            content = canvas = ctx = msg = resizeObs = housekeeping = null;
+            content = canvas = ctx = fx = fxCtx = msg = resizeObs = housekeeping = grain = null;
             token++;
-            level = bloom = 0;
-            particles = [];
+            level = bloom = kick = intro = 0;
+            particles = []; shocks = []; bolts = [];
         }
 
         function setStyle(next) {
             if (!Object.hasOwn(VIS_STYLES, next)) return;
             style = next;
             lsSet(LS_VIS_STYLE, next);
-            particles = [];
+            particles = []; shocks = []; bolts = [];
             wipe = true;
             wake();
         }
@@ -1930,10 +2233,11 @@ html.henge-on.henge-resizing .henge-handle {
             bars: track?.bars.length ?? null,
             sections: track?.sections.length ?? null,
             canvas: canvas ? [canvas.width, canvas.height] : null, scale,
-            running: !!raf, theme, swatches,
+            running: !!raf, theme, swatches, swatchSource, swatchError,
             palette: palette && { a: hex(palette.a), b: hex(palette.b), c: hex(palette.c) },
-            energy: +energy.toFixed(2), edge: +edge.toFixed(2),
-            particles: particles.length, cover: cover?.src ?? null, cached: cache.size,
+            energy: +energy.toFixed(2), edge: +edge.toFixed(2), heat: +heat.toFixed(2),
+            particles: particles.length, shocks: shocks.length, bolts: bolts.length,
+            cover: cover?.src ?? null, coverReady, cached: cache.size,
         });
 
         return {
