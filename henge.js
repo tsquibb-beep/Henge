@@ -561,6 +561,7 @@ html.henge-on.henge-resizing .henge-handle {
 }
 #henge-picker .henge-picker-row span {
     flex: none;
+    width: 6.5rem;
     color: var(--text-subdued, #b3b3b3);
     font-size: 11px;
     letter-spacing: .05em;
@@ -1260,7 +1261,9 @@ html.henge-on.henge-resizing .henge-handle {
     // local files show a message instead.
 
     const LS_VIS_STYLE = 'henge:visualiserStyle';
-    const VIS_STYLES = { mirror: 'Mirrored wave', line: 'Line', scroll: 'Scrolling waveform' };
+    const LS_VIS_COLOURS = 'henge:visualiserColours';
+    const VIS_STYLES = { mirror: 'Mirrored wave', radial: 'Radial', line: 'Line', scroll: 'Scrolling waveform' };
+    const VIS_COLOURS = { theme: 'Theme', album: 'Album art' };
 
     // ── Visualiser maths (pure; tools/test-visualiser.js extracts this block) ──
 
@@ -1271,9 +1274,10 @@ html.henge-on.henge-resizing .henge-handle {
     const clamp01 = v => Math.max(0, Math.min(1, v));
     const isTrackUri = uri => typeof uri === 'string' && uri.startsWith('spotify:track:');
 
-    // Index of the item (segment or beat) playing at t seconds: the last one
-    // starting at or before t, or -1 before the first. `hint` is the previous
-    // answer, usually still right or one short, which skips the search.
+    // Index of the item (segment, beat, bar, section) playing at t seconds:
+    // the last one starting at or before t, or -1 before the first. `hint` is
+    // the previous answer, usually still right or one short, which skips the
+    // search.
     function indexAt(list, t, hint = -1) {
         const n = list.length;
         if (!n || t < list[0].start) return -1;
@@ -1304,11 +1308,11 @@ html.henge-on.henge-resizing .henge-handle {
     // dB to a 0…1 level, curved so quiet passages stay visibly lower.
     const dbToLevel = db => clamp01((db - VIS_DB_FLOOR) / -VIS_DB_FLOOR) ** 1.5;
 
-    // 1 on a beat, fading over about a third of a second.
-    function beatPulse(beat, t) {
+    // 1 on a beat (or bar), fading with time constant tau.
+    function beatPulse(beat, t, tau = 0.12) {
         if (!beat) return 0;
         const dt = t - beat.start;
-        return dt < 0 ? 0 : Math.exp(-dt / 0.12);
+        return dt < 0 ? 0 : Math.exp(-dt / tau);
     }
 
     // The 12 pitch values at t, blended from this segment's towards the next.
@@ -1333,18 +1337,137 @@ html.henge-on.henge-resizing .henge-handle {
     // Eases v towards target with time constant tau (seconds) over dt.
     const ease = (v, target, dt, tau) => v + (target - v) * (1 - Math.exp(-dt / tau));
 
+    // Mean and spread of some numbers (spread never 0).
+    function spread(values) {
+        const n = values.length || 1;
+        const mean = values.reduce((s, v) => s + v, 0) / n;
+        const sd = Math.sqrt(values.reduce((s, v) => s + (v - mean) ** 2, 0) / n);
+        return { mean, sd: sd || 1 };
+    }
+
+    // The analysis reduced to what the visualiser draws from, plus per-track
+    // ranges: timbre[1] (brightness) for the wave's edge, section loudness
+    // for its energy. null when there's nothing to draw.
+    function prepareTrack(raw) {
+        const segments = raw?.segments;
+        if (!Array.isArray(segments) || !segments.length) return null;
+        const sections = raw.sections ?? [];
+        const loud = sections.map(s => s.loudness).filter(Number.isFinite);
+        const last = segments[segments.length - 1];
+        return {
+            segments,
+            beats: raw.beats ?? [],
+            bars: raw.bars ?? [],
+            sections,
+            duration: raw.track?.duration ?? last.start + last.duration,
+            tempo: raw.track?.tempo || 120,
+            bright: spread(segments.map(s => s.timbre?.[1] ?? 0)),
+            loudMin: loud.length ? Math.min(...loud) : 0,
+            loudMax: loud.length ? Math.max(...loud) : 0,
+        };
+    }
+
+    // How bright a segment sounds next to the rest of its track, 0…1.
+    function brightness(track, seg) {
+        const z = ((seg.timbre?.[1] ?? track.bright.mean) - track.bright.mean) / track.bright.sd;
+        return 1 / (1 + Math.exp(-1.5 * z));
+    }
+
+    // A section's loudness within its track's range, 0…1 (0.6 when flat).
+    function sectionEnergy(track, section) {
+        const range = track.loudMax - track.loudMin;
+        if (!section || range < 0.5) return 0.6;
+        return clamp01((section.loudness - track.loudMin) / range);
+    }
+
+    // [r, g, b] from "#rgb", "#rrggbb", "rgb(…)", or the colour extractor's
+    // "#" + an ARGB number in hex (alpha ignored, may be negative).
+    function parseColour(s) {
+        s = String(s ?? '').trim();
+        let m = s.match(/^#([0-9a-f]{3})$/i);
+        if (m) return [...m[1]].map(h => parseInt(h + h, 16));
+        m = s.match(/^#(-?[0-9a-f]{1,8})$/i);
+        if (m) {
+            const v = (parseInt(m[1], 16) >>> 0) & 0xffffff;
+            return [v >> 16, (v >> 8) & 255, v & 255];
+        }
+        m = s.match(/^rgba?\(\s*(\d+)[\s,]+(\d+)[\s,]+(\d+)/i);
+        return m ? [+m[1], +m[2], +m[3]] : null;
+    }
+
+    function rgbToHsl([r, g, b]) {
+        r /= 255; g /= 255; b /= 255;
+        const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2;
+        if (max === min) return [0, 0, l];
+        const d = max - min;
+        const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+        const h = max === r ? (g - b) / d + (g < b ? 6 : 0) : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+        return [h * 60, s, l];
+    }
+
+    function hslToRgb([h, s, l]) {
+        h = ((h % 360) + 360) % 360;
+        const k = n => (n + h / 30) % 12;
+        const a = s * Math.min(l, 1 - l);
+        const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, 9 - k(n), 1));
+        return [f(0), f(8), f(4)].map(v => Math.round(v * 255));
+    }
+
+    // Hue turned by deg; lightness raised to at least minL (dark album
+    // colours vanish on Spotify's dark background).
+    function adjustColour(rgb, { minL = 0, deg = 0 } = {}) {
+        const [h, s, l] = rgbToHsl(rgb);
+        return hslToRgb([h + deg, s, Math.max(l, minL)]);
+    }
+
+    const mixRgb = (a, b, f) => a.map((v, i) => lerp(v, b[i], f));
+    const rgba = (c, alpha) => `rgba(${Math.round(c[0])}, ${Math.round(c[1])}, ${Math.round(c[2])}, ${alpha})`;
+
+    // Three colours: a (the main wave), b (the back layer), c (highlights).
+    function themePalette(accent, text) {
+        const a = parseColour(accent) ?? [30, 215, 96];
+        const t = parseColour(text) ?? [255, 255, 255];
+        return { a, b: adjustColour(a, { deg: -35 }), c: mixRgb(a, t, 0.4) };
+    }
+
+    // From Spotify's colour extractor swatches for the album art; null
+    // without a usable one.
+    function albumPalette(swatches) {
+        const pick = (...keys) => keys.map(k => parseColour(swatches?.[k])).find(Boolean);
+        const a = pick('VIBRANT_NON_ALARMING', 'VIBRANT', 'PROMINENT');
+        if (!a) return null;
+        const b = pick('DARK_VIBRANT', 'PROMINENT', 'DESATURATED') ?? adjustColour(a, { deg: -35 });
+        const c = pick('LIGHT_VIBRANT') ?? mixRgb(a, [255, 255, 255], 0.4);
+        return {
+            a: adjustColour(a, { minL: 0.5 }),
+            b: adjustColour(b, { minL: 0.42 }),
+            c: adjustColour(c, { minL: 0.62 }),
+        };
+    }
+
     // ── Visualiser view ──
 
     const visualiser = (() => {
+        const MAX_PIXELS = 1.6e6;   // canvas resolution cap: glow is costly
+        const savedOr = (key, options, fallback) => {
+            const v = lsGet(key);
+            return Object.hasOwn(options, v ?? '') ? v : fallback;
+        };
         let content = null, canvas = null, ctx = null, msg = null, resizeObs = null, housekeeping = null;
-        const saved = lsGet(LS_VIS_STYLE);
-        let style = Object.hasOwn(VIS_STYLES, saved ?? '') ? saved : 'mirror';
-        let colours = {};
-        const cache = new Map();   // uri → analysis, the last few tracks
-        let uri = null, data = null, state = 'idle', error = null, token = 0;
-        let raf = 0, lastFrame = 0, lastDrawnT = -1;
-        let level = 0, phase = 0, segIdx = -1, beatIdx = -1;
+        let style = savedOr(LS_VIS_STYLE, VIS_STYLES, 'mirror');
+        let colourMode = savedOr(LS_VIS_COLOURS, VIS_COLOURS, 'theme');
+        let theme = {};                     // --spice-* colour strings
+        const cache = new Map();            // uri → prepared track (or null), the last few
+        const swatchCache = new Map();      // uri → album colour swatches (or null)
+        let uri = null, track = null, state = 'idle', error = null, token = 0;
+        let swatches = null, cover = null;
+        let raf = 0, lastFrame = 0, lastDrawnT = -1, scale = 1, wipe = true;
+        // Animated values, eased every frame.
+        let level = 0, edge = 0.5, energy = 0.6, bloom = 0, downbeat = 0, pulse = 0, phase = 0, spin = 0;
+        let segIdx = -1, beatIdx = -1, barIdx = -1, secIdx = -1;
         let pitches = new Array(12).fill(0);
+        let palette = null, goal = null;    // { a, b, c } as [r, g, b]; palette fades to goal
+        let particles = [];
 
         const MESSAGES = {
             idle: 'Play a song to see the visualiser.',
@@ -1352,8 +1475,13 @@ html.henge-on.henge-resizing .henge-handle {
             nodata: 'No visualiser data for this track.',
         };
 
+        function remember(map, key, value) {
+            map.set(key, value);
+            while (map.size > 5) map.delete(map.keys().next().value);
+        }
+
         // Spicetify themes set --spice-* on :root, and Spotify's CSS uses them.
-        function readColours() {
+        function readTheme() {
             const cs = getComputedStyle(html);
             const v = name => cs.getPropertyValue(name).trim();
             const next = {
@@ -1361,9 +1489,16 @@ html.henge-on.henge-resizing .henge-handle {
                 text: v('--spice-text') || '#ffffff',
                 subdued: v('--spice-subtext') || '#b3b3b3',
             };
-            const changed = JSON.stringify(next) !== JSON.stringify(colours);
-            colours = next;
+            const changed = JSON.stringify(next) !== JSON.stringify(theme);
+            theme = next;
+            if (changed) retarget();
             return changed;
+        }
+
+        function retarget() {
+            goal = (colourMode === 'album' && albumPalette(swatches)) || themePalette(theme.accent, theme.text);
+            palette ??= goal;
+            wake();
         }
 
         function showState(next, err = null) {
@@ -1388,27 +1523,64 @@ html.henge-on.henge-resizing .henge-handle {
                 `https://spclient.wg.spotify.com/audio-attributes/v1/audio-analysis/${u.split(':')[2]}?format=json`);
         }
 
+        // Album colours, only fetched in album mode. The old colours stay
+        // until the new ones arrive, so a song change is one crossfade.
+        function loadSwatches(mine) {
+            if (colourMode !== 'album' || !uri || !Spicetify.colorExtractor) {
+                swatches = null;
+                return retarget();
+            }
+            if (swatchCache.has(uri)) {
+                swatches = swatchCache.get(uri);
+                return retarget();
+            }
+            const u = uri;
+            Spicetify.colorExtractor(u).catch(() => null).then(sw => {
+                remember(swatchCache, u, sw);
+                if (mine === token) { swatches = sw; retarget(); }
+            });
+        }
+
+        function coverUrl() {
+            const m = Spicetify.Player?.data?.item?.metadata ?? {};
+            const u = m.image_xlarge_url || m.image_large_url || m.image_url || '';
+            if (u.startsWith('spotify:image:')) return `https://i.scdn.co/image/${u.slice(14)}`;
+            return u.startsWith('https:') ? u : null;
+        }
+
+        function loadCover() {
+            const url = coverUrl();
+            if (cover?.src === url) return;
+            cover = null;
+            if (!url) return;
+            const img = new Image();
+            img.onload = () => wake();
+            img.src = url;
+            cover = img;
+        }
+
         // Loads the current track's analysis; a later call wins over a slow one.
         async function load() {
             const mine = ++token;
             uri = Spicetify.Player?.data?.item?.uri ?? null;
-            data = null;
-            segIdx = beatIdx = -1;
+            track = null;
+            segIdx = beatIdx = barIdx = secIdx = -1;
+            wipe = true;
+            loadCover();
+            loadSwatches(mine);
             if (!uri) return showState('idle');
             if (!isTrackUri(uri)) return showState('nodata');
             if (cache.has(uri)) {
-                data = cache.get(uri);
-                return showState(data ? 'ready' : 'nodata');
+                track = cache.get(uri);
+                return showState(track ? 'ready' : 'nodata');
             }
             showState('loading');
             try {
-                const d = await fetchAnalysis(uri);
+                const raw = await fetchAnalysis(uri);
                 if (mine !== token) return;
-                const usable = d?.segments?.length ? d : null;
-                cache.set(uri, usable);
-                while (cache.size > 5) cache.delete(cache.keys().next().value);
-                data = usable;
-                showState(usable ? 'ready' : 'nodata');
+                track = prepareTrack(raw);
+                remember(cache, uri, track);
+                showState(track ? 'ready' : 'nodata');
             } catch (e) {
                 if (mine !== token) return;
                 warn('visualiser data:', e);
@@ -1418,8 +1590,9 @@ html.henge-on.henge-resizing .henge-handle {
         }
 
         function fitCanvas() {
-            const dpr = window.devicePixelRatio || 1;
-            const w = Math.round(content.clientWidth * dpr), h = Math.round(content.clientHeight * dpr);
+            const cw = content.clientWidth, ch = content.clientHeight;
+            scale = Math.min(window.devicePixelRatio || 1, Math.sqrt(MAX_PIXELS / Math.max(1, cw * ch)));
+            const w = Math.round(cw * scale), h = Math.round(ch * scale);
             if (canvas.width !== w || canvas.height !== h) {
                 canvas.width = w;
                 canvas.height = h;
@@ -1432,69 +1605,185 @@ html.henge-on.henge-resizing .henge-handle {
         };
         const playing = () => !!Spicetify.Player?.isPlaying?.();
 
-        // Height (0…1) of the wave at x (0…1): the level, shaped by the
-        // pitch curve drifting across, tapered to nothing at the edges.
-        function amplitude(x, pulse) {
-            const u = ((x * 12 + phase) % 12 + 12) % 12;
-            const shape = 0.35 + 0.65 * clamp01(chromaAt(pitches, u));
-            return level * Math.sin(Math.PI * x) ** 0.8 * shape * (1 + 0.3 * pulse);
+        // Back to front. The back layers come in as a section gets louder.
+        const layers = () => [
+            { k: 1.15, speed: 0.55, offset: 4, alpha: 0.06 + 0.18 * energy, colour: palette.b },
+            { k: 0.85, speed: 1.4, offset: 8, alpha: 0.08 + 0.16 * energy, colour: palette.c },
+            { k: 1, speed: 1, offset: 0, alpha: 1, colour: palette.a, front: true },
+        ];
+
+        // Height (0…1) of a wave layer at x (0…1): the level, shaped by the
+        // pitch curve drifting across. Brighter sounds give narrower peaks
+        // and a fine ripple; louder sections and downbeats lift it. `taper`
+        // brings it to nothing at the ends (the ring wraps instead).
+        function amplitude(x, layer, taper) {
+            const u = ((x * 12 + phase * layer.speed + layer.offset) % 12 + 12) % 12;
+            const c = clamp01(chromaAt(pitches, u));
+            const shape = 0.3 + 0.7 * c ** (1 + 2 * edge)
+                + 0.1 * edge * Math.sin(2 * Math.PI * 9 * x + phase * 3 * layer.speed);
+            const lift = (0.75 + 0.35 * energy) * (1 + 0.28 * downbeat + 0.12 * pulse + 0.2 * bloom);
+            const a = level * shape * lift * layer.k * (taper ? Math.sin(Math.PI * x) ** 0.8 : 1);
+            return clamp01(a);
         }
 
-        function drawWave(W, H, pulse) {
-            const dpr = window.devicePixelRatio || 1;
-            const mid = H / 2, max = mid - 4 * dpr;
-            const n = Math.max(2, Math.min(240, Math.round(W / (4 * dpr))));
-            const amps = Array.from({ length: n + 1 }, (_, i) => amplitude(i / n, pulse));
-            ctx.lineJoin = 'round';
-            // A faint centre line, so a flat (paused) panel isn't blank.
-            ctx.globalAlpha = 0.35;
-            ctx.fillStyle = colours.subdued;
-            ctx.fillRect(0, mid - dpr / 2, W, dpr);
-            ctx.globalAlpha = 1;
-            ctx.strokeStyle = colours.accent;
-            ctx.lineWidth = 2 * dpr;
-            ctx.beginPath();
-            if (style === 'line') {
-                // A trace rippling under the same envelope.
-                amps.forEach((a, i) => {
-                    const x = i / n;
-                    const y = mid - a * max * Math.sin(2 * Math.PI * 4 * x - phase * 2.5);
-                    if (i) ctx.lineTo(x * W, y); else ctx.moveTo(0, y);
-                });
+        function glow(colour) {
+            ctx.shadowColor = rgba(colour, 0.9);
+            ctx.shadowBlur = (6 + 14 * downbeat + 18 * bloom) * scale;
+        }
+
+        function drawMirror(W, H) {
+            const mid = H / 2, max = mid - 6 * scale;
+            const n = Math.max(2, Math.min(240, Math.round(W / (4 * scale))));
+            // The centre line brightens on downbeats.
+            ctx.fillStyle = rgba(palette.c, 0.15 + 0.5 * downbeat);
+            ctx.fillRect(0, mid - scale / 2, W, scale);
+            for (const layer of layers()) {
+                const amps = Array.from({ length: n + 1 }, (_, i) => amplitude(i / n, layer, true));
+                ctx.beginPath();
+                ctx.moveTo(0, mid);
+                for (let i = 1; i <= n; i++) ctx.lineTo(i / n * W, mid - amps[i] * max);
+                for (let i = n; i >= 0; i--) ctx.lineTo(i / n * W, mid + amps[i] * max);
+                ctx.closePath();
+                if (!layer.front) {
+                    ctx.fillStyle = rgba(layer.colour, layer.alpha);
+                    ctx.fill();
+                    continue;
+                }
+                const g = ctx.createLinearGradient(0, mid - max, 0, mid + max);
+                g.addColorStop(0, rgba(layer.colour, 0.03));
+                g.addColorStop(0.5, rgba(layer.colour, 0.45 + 0.2 * downbeat));
+                g.addColorStop(1, rgba(layer.colour, 0.03));
+                ctx.fillStyle = g;
+                ctx.fill();
+                glow(layer.colour);
+                ctx.strokeStyle = rgba(mixRgb(layer.colour, palette.c, 0.3), 1);
+                ctx.lineWidth = 2 * scale;
                 ctx.stroke();
-                return;
+                ctx.shadowBlur = 0;
             }
-            amps.forEach((a, i) => { if (i) ctx.lineTo(i / n * W, mid - a * max); else ctx.moveTo(0, mid); });
-            for (let i = n; i >= 0; i--) ctx.lineTo(i / n * W, mid + amps[i] * max);
-            ctx.closePath();
-            ctx.globalAlpha = 0.35;
-            ctx.fillStyle = colours.accent;
-            ctx.fill();
-            ctx.globalAlpha = 1;
+        }
+
+        // The wave wrapped into a ring around the album cover, which turns
+        // slowly while the song plays. Particles burst out on downbeats.
+        function drawRadial(W, H, dt) {
+            const cx = W / 2, cy = H / 2, m = Math.min(W, H);
+            const R = m * 0.27, span = m * 0.2, n = 200;
+            const r = R * 0.8 * (1 + 0.035 * downbeat);
+            ctx.save();
+            ctx.beginPath();
+            ctx.arc(cx, cy, r, 0, 2 * Math.PI);
+            ctx.clip();
+            if (cover?.complete && cover.naturalWidth) {
+                ctx.translate(cx, cy);
+                ctx.rotate(spin);
+                ctx.drawImage(cover, -r, -r, 2 * r, 2 * r);
+            } else {
+                ctx.fillStyle = rgba(palette.b, 0.3);
+                ctx.fillRect(cx - r, cy - r, 2 * r, 2 * r);
+            }
+            ctx.restore();
+            ctx.strokeStyle = rgba(palette.c, 0.3 + 0.4 * downbeat);
+            ctx.lineWidth = 1.5 * scale;
+            ctx.beginPath();
+            ctx.arc(cx, cy, r + 2 * scale, 0, 2 * Math.PI);
             ctx.stroke();
+
+            const ring = (amps, radius) => {
+                amps.forEach((a, i) => {
+                    const th = i / n * 2 * Math.PI - Math.PI / 2, rad = radius(a);
+                    const x = cx + Math.cos(th) * rad, y = cy + Math.sin(th) * rad;
+                    if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+                });
+                ctx.closePath();
+            };
+            for (const layer of layers()) {
+                const amps = Array.from({ length: n }, (_, i) => amplitude(i / n, layer, false));
+                ctx.beginPath();
+                ring(amps, a => R + a * span);
+                ring(amps, a => R - a * span * 0.25);
+                if (!layer.front) {
+                    ctx.fillStyle = rgba(layer.colour, layer.alpha);
+                    ctx.fill('evenodd');
+                    continue;
+                }
+                const g = ctx.createRadialGradient(cx, cy, R - span * 0.25, cx, cy, R + span);
+                g.addColorStop(0, rgba(layer.colour, 0.3));
+                g.addColorStop(0.2, rgba(layer.colour, 0.5 + 0.2 * downbeat));
+                g.addColorStop(1, rgba(layer.colour, 0.03));
+                ctx.fillStyle = g;
+                ctx.fill('evenodd');
+                ctx.beginPath();
+                ring(amps, a => R + a * span);
+                glow(layer.colour);
+                ctx.strokeStyle = rgba(mixRgb(layer.colour, palette.c, 0.3), 1);
+                ctx.lineWidth = 2 * scale;
+                ctx.stroke();
+                ctx.shadowBlur = 0;
+            }
+
+            // Particles live in units of the panel's smaller side.
+            particles = particles.filter(p => (p.life -= dt / 1.6) > 0);
+            for (const p of particles) {
+                p.r += p.v * dt;
+                ctx.fillStyle = rgba(palette.c, 0.85 * p.life);
+                ctx.beginPath();
+                ctx.arc(cx + Math.cos(p.th) * p.r * m, cy + Math.sin(p.th) * p.r * m, (1 + 2 * p.life) * scale, 0, 2 * Math.PI);
+                ctx.fill();
+            }
+        }
+
+        function emit(count, speed) {
+            for (let i = 0; i < count && particles.length < 260; i++) {
+                particles.push({ th: Math.random() * 2 * Math.PI, r: 0.27 + 0.2 * level, v: speed * (0.5 + Math.random()), life: 1 });
+            }
+        }
+
+        // An oscilloscope trace under the wave's envelope, with a fainter
+        // echo behind it.
+        function drawLine(W, H) {
+            const mid = H / 2, max = mid - 6 * scale;
+            const n = Math.max(2, Math.min(240, Math.round(W / (4 * scale))));
+            const trace = (layer, cycles, shift) => {
+                ctx.beginPath();
+                for (let i = 0; i <= n; i++) {
+                    const x = i / n;
+                    const y = mid - amplitude(x, layer, true) * max * Math.sin(2 * Math.PI * cycles * x - phase * 2.5 * layer.speed + shift);
+                    if (i) ctx.lineTo(x * W, y); else ctx.moveTo(0, y);
+                }
+                ctx.stroke();
+            };
+            const [back, , front] = layers();
+            ctx.strokeStyle = rgba(palette.b, 0.55);
+            ctx.lineWidth = 1.5 * scale;
+            trace(back, 3, 1.3);
+            glow(palette.a);
+            ctx.strokeStyle = rgba(mixRgb(palette.a, palette.c, 0.2), 1);
+            ctx.lineWidth = 2 * scale;
+            trace(front, 4, 0);
+            ctx.shadowBlur = 0;
         }
 
         // The track's loudness as bars scrolling past a centre "now" marker.
         function drawScroll(W, H, t) {
-            const dpr = window.devicePixelRatio || 1;
-            const mid = H / 2, max = mid - 4 * dpr;
-            const barW = 3 * dpr, step = 5 * dpr;
-            const segs = data.segments, dur = data.track?.duration ?? Infinity;
+            const mid = H / 2, max = mid - 4 * scale;
+            const barW = 3 * scale, step = 5 * scale;
+            const segs = track.segments;
             const dtBar = VIS_WINDOW * step / W;
+            const played = theme.subdued, coming = rgba(palette.a, 1);
             let idx = -1;
             for (let tb = Math.ceil((t - VIS_WINDOW / 2) / dtBar) * dtBar; ; tb += dtBar) {
                 const x = W / 2 + (tb - t) / VIS_WINDOW * W;
                 if (x > W) break;
-                if (tb < 0 || tb > dur) continue;
+                if (tb < 0 || tb > track.duration) continue;
                 idx = indexAt(segs, tb, idx);
                 if (idx < 0) continue;
-                const h = Math.max(dpr, dbToLevel(loudnessAt(segs[idx], segs[idx + 1], tb)) * max);
-                ctx.fillStyle = tb < t ? colours.subdued : colours.accent;
+                const h = Math.max(scale, dbToLevel(loudnessAt(segs[idx], segs[idx + 1], tb)) * max);
+                ctx.fillStyle = tb < t ? played : coming;
                 ctx.fillRect(x - barW / 2, mid - h, barW, 2 * h);
             }
             ctx.globalAlpha = 0.8;
-            ctx.fillStyle = colours.text;
-            ctx.fillRect(W / 2 - dpr, 0, 2 * dpr, H);
+            ctx.fillStyle = theme.text;
+            ctx.fillRect(W / 2 - scale, 0, 2 * scale, H);
             ctx.globalAlpha = 1;
         }
 
@@ -1504,34 +1793,68 @@ html.henge-on.henge-resizing .henge-handle {
             const dt = lastFrame ? Math.min(0.1, (now - lastFrame) / 1000) : 0;
             lastFrame = now;
             const t = progress(), on = playing();
-            let target = 0, pulse = 0;
+            let levelTo = 0, beat = 0, bar = 0, edgeTo = edge, energyTo = energy;
             if (state === 'ready' && on) {
-                const segs = data.segments, beats = data.beats ?? [];
+                const segs = track.segments;
                 segIdx = indexAt(segs, t, segIdx);
                 if (segIdx >= 0) {
                     const seg = segs[segIdx], next = segs[segIdx + 1];
-                    target = dbToLevel(loudnessAt(seg, next, t));
+                    levelTo = dbToLevel(loudnessAt(seg, next, t));
                     const p = pitchesAt(seg, next, t);
                     pitches = pitches.map((v, i) => ease(v, p[i], dt, 0.12));
+                    edgeTo = brightness(track, seg);
                 }
-                beatIdx = indexAt(beats, t, beatIdx);
-                pulse = beatPulse(beats[beatIdx], t);
+                beatIdx = indexAt(track.beats, t, beatIdx);
+                beat = beatPulse(track.beats[beatIdx], t);
+                const prevBar = barIdx;
+                barIdx = indexAt(track.bars, t, barIdx);
+                bar = beatPulse(track.bars[barIdx], t, 0.25);
+                if (barIdx !== prevBar && barIdx >= 0 && style === 'radial') emit(6 + Math.round(16 * energy), 0.12 + 0.25 * level);
+                const prevSec = secIdx;
+                secIdx = indexAt(track.sections, t, secIdx);
+                energyTo = sectionEnergy(track, track.sections[secIdx]);
+                // A new section (into the chorus, say) flares.
+                if (secIdx !== prevSec && prevSec >= 0) {
+                    bloom = 1;
+                    if (style === 'radial') emit(40, 0.3);
+                }
+                spin += dt * 2 * Math.PI * 0.1 * (track.tempo / 120);
             }
-            level = ease(level, target, dt, 0.08);
+            level = ease(level, levelTo, dt, 0.08);
+            edge = ease(edge, edgeTo, dt, 0.25);
+            energy = ease(energy, energyTo, dt, 1.2);
+            pulse = ease(pulse, beat, dt, 0.03);
+            downbeat = ease(downbeat, bar, dt, 0.03);
+            bloom *= Math.exp(-dt / 0.9);
             phase += dt * (0.6 + 2 * level);
+            const fade = 1 - Math.exp(-dt / 0.5);
+            if (palette && goal) palette = { a: mixRgb(palette.a, goal.a, fade), b: mixRgb(palette.b, goal.b, fade), c: mixRgb(palette.c, goal.c, fade) };
 
             const W = canvas.width, H = canvas.height;
             if (W && H) {
-                ctx.clearRect(0, 0, W, H);
-                if (state === 'ready') {
-                    if (style === 'scroll') drawScroll(W, H, t); else drawWave(W, H, pulse);
+                if (style === 'scroll' || wipe || !dt || state !== 'ready') {
+                    ctx.clearRect(0, 0, W, H);
+                } else {
+                    // Trails: fade what's there instead of clearing it.
+                    ctx.globalCompositeOperation = 'destination-out';
+                    ctx.fillStyle = `rgba(0, 0, 0, ${1 - Math.exp(-dt / 0.045)})`;
+                    ctx.fillRect(0, 0, W, H);
+                    ctx.globalCompositeOperation = 'source-over';
+                }
+                wipe = false;
+                if (state === 'ready' && palette) {
+                    if (style === 'scroll') drawScroll(W, H, t);
+                    else if (style === 'line') drawLine(W, H);
+                    else if (style === 'radial') drawRadial(W, H, dt);
+                    else drawMirror(W, H);
                 }
             }
             lastDrawnT = t;
-            // Paused (or nothing to show): stop once the wave has settled.
+            // Paused (or nothing to show): stop once everything has settled.
             // Housekeeping restarts it if anything changes.
-            const settled = !on && (style === 'scroll' || level < 0.002);
-            if (!settled && state === 'ready' && W && H) raf = requestAnimationFrame(frame);
+            const fading = palette && goal && ['a', 'b', 'c'].some(k => palette[k].some((v, i) => Math.abs(v - goal[k][i]) > 0.5));
+            const still = style === 'scroll' || (level < 0.002 && bloom < 0.01 && !particles.length);
+            if ((on || !still || fading) && state === 'ready' && W && H) raf = requestAnimationFrame(frame);
             else lastFrame = 0;
         }
 
@@ -1550,8 +1873,7 @@ html.henge-on.henge-resizing .henge-handle {
             msg = document.createElement('div');
             msg.className = 'henge-view-msg';
             content.append(canvas, msg);
-            readColours();
-            resizeObs = new ResizeObserver(() => { fitCanvas(); wake(); });
+            resizeObs = new ResizeObserver(() => { fitCanvas(); wipe = true; wake(); });
             resizeObs.observe(content);
             fitCanvas();
             Spicetify.Player?.addEventListener?.('songchange', onSong);
@@ -1559,9 +1881,10 @@ html.henge-on.henge-resizing .henge-handle {
             // Theme colours can change live (Marketplace), and a seek while
             // paused fires no event: check both now and then.
             housekeeping = setInterval(() => {
-                const recoloured = readColours();
+                const recoloured = readTheme();
                 if (recoloured || playing() || Math.abs(progress() - lastDrawnT) > 0.05) wake();
             }, 1000);
+            readTheme();
             load();
             wake();
         }
@@ -1579,25 +1902,45 @@ html.henge-on.henge-resizing .henge-handle {
             msg.remove();
             content = canvas = ctx = msg = resizeObs = housekeeping = null;
             token++;
-            level = 0;
+            level = bloom = 0;
+            particles = [];
         }
 
         function setStyle(next) {
             if (!Object.hasOwn(VIS_STYLES, next)) return;
             style = next;
             lsSet(LS_VIS_STYLE, next);
+            particles = [];
+            wipe = true;
             wake();
         }
 
+        function setColours(next) {
+            if (!Object.hasOwn(VIS_COLOURS, next)) return;
+            colourMode = next;
+            lsSet(LS_VIS_COLOURS, next);
+            loadSwatches(token);
+        }
+
+        const hex = c => c && `#${c.map(v => Math.round(v).toString(16).padStart(2, '0')).join('')}`;
         const info = () => ({
-            mounted: !!canvas, style, state, error, uri,
-            segments: data?.segments?.length ?? null,
-            beats: data?.beats?.length ?? null,
-            canvas: canvas ? [canvas.width, canvas.height] : null,
-            running: !!raf, colours, cached: cache.size,
+            mounted: !!canvas, style, colours: colourMode, state, error, uri,
+            segments: track?.segments.length ?? null,
+            beats: track?.beats.length ?? null,
+            bars: track?.bars.length ?? null,
+            sections: track?.sections.length ?? null,
+            canvas: canvas ? [canvas.width, canvas.height] : null, scale,
+            running: !!raf, theme, swatches,
+            palette: palette && { a: hex(palette.a), b: hex(palette.b), c: hex(palette.c) },
+            energy: +energy.toFixed(2), edge: +edge.toFixed(2),
+            particles: particles.length, cover: cover?.src ?? null, cached: cache.size,
         });
 
-        return { mount, unmount, setStyle, info, get style() { return style; } };
+        return {
+            mount, unmount, setStyle, setColours, info,
+            get style() { return style; },
+            get colours() { return colourMode; },
+        };
     })();
 
     // ── Watching Spotify ──────────────────────────────────────────────────────
@@ -1814,18 +2157,18 @@ html.henge-on.henge-resizing .henge-handle {
     }
 
     // Shown while the visualiser is placed.
-    function visualiserRow() {
+    function visualiserRow(label, options, current, onChange) {
         const row = document.createElement('label');
         row.className = 'henge-picker-row';
         const name = document.createElement('span');
-        name.textContent = 'Visualiser style';
+        name.textContent = label;
         const select = document.createElement('select');
-        for (const [value, label] of Object.entries(VIS_STYLES)) {
+        for (const [value, text] of Object.entries(options)) {
             select.append(Object.assign(document.createElement('option'), {
-                value, textContent: label, selected: value === visualiser.style,
+                value, textContent: text, selected: value === current,
             }));
         }
-        row.append(name, pickerSelect(select, value => visualiser.setStyle(value)));
+        row.append(name, pickerSelect(select, onChange));
         return row;
     }
 
@@ -1855,7 +2198,11 @@ html.henge-on.henge-resizing .henge-handle {
             map.append(box);
         }
         picker.append(map);
-        if (slotOf(layout, 'visualiser')) picker.append(visualiserRow());
+        if (slotOf(layout, 'visualiser')) {
+            picker.append(
+                visualiserRow('Visualiser', VIS_STYLES, visualiser.style, v => visualiser.setStyle(v)),
+                visualiserRow('Colours', VIS_COLOURS, visualiser.colours, v => visualiser.setColours(v)));
+        }
 
         const foot = document.createElement('div');
         foot.className = 'henge-picker-foot';

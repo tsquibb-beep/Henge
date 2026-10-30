@@ -8,9 +8,9 @@ const src = fs.readFileSync(require('path').join(__dirname, '..', 'henge.js'), '
 const start = src.indexOf('    // ── Visualiser maths');
 const end = src.indexOf('    // ── Visualiser view');
 if (start < 0 || end < start) throw new Error('visualiser markers not found in henge.js');
-const code = `${src.slice(start, end)}\nmodule.exports={indexAt, loudnessAt, dbToLevel, beatPulse, pitchesAt, catmull, chromaAt, ease, isTrackUri, VIS_DB_FLOOR};`;
+const code = `${src.slice(start, end)}\nmodule.exports={indexAt, loudnessAt, dbToLevel, beatPulse, pitchesAt, catmull, chromaAt, ease, isTrackUri, VIS_DB_FLOOR, spread, prepareTrack, brightness, sectionEnergy, parseColour, rgbToHsl, hslToRgb, adjustColour, themePalette, albumPalette};`;
 const m = {}; new Function('module', code)(m);
-const { indexAt, loudnessAt, dbToLevel, beatPulse, pitchesAt, catmull, chromaAt, ease, isTrackUri, VIS_DB_FLOOR } = m.exports;
+const { indexAt, loudnessAt, dbToLevel, beatPulse, pitchesAt, catmull, chromaAt, ease, isTrackUri, VIS_DB_FLOOR, spread, prepareTrack, brightness, sectionEnergy, parseColour, rgbToHsl, hslToRgb, adjustColour, themePalette, albumPalette } = m.exports;
 
 let pass = 0, fail = 0;
 const near = (a, b, eps = 1e-6) => Math.abs(a - b) <= eps;
@@ -74,6 +74,7 @@ check('pulse none without beat', beatPulse(undefined, 1) === 0);
 check('pulse before beat', beatPulse(beats[0], 0.1) === 0);
 check('pulse on beat', near(beatPulse(beats[0], 0.25), 1));
 check('pulse decays by 0.3s', beatPulse(beats[0], 0.55) < 0.1);
+check('bar pulse decays slower', beatPulse(beats[0], 0.55, 0.25) > beatPulse(beats[0], 0.55));
 
 // pitchesAt
 check('pitches at start', pitchesAt(s0, s1, 0).every((p, i) => near(p, s0.pitches[i])));
@@ -99,6 +100,53 @@ check('track uri', isTrackUri('spotify:track:4uLU6hMCjMI75M1A2tKUQC'));
 check('local file not a track', !isTrackUri('spotify:local:Artist:Album:Title:180'));
 check('episode not a track', !isTrackUri('spotify:episode:abc'));
 check('missing uri', !isTrackUri(undefined) && !isTrackUri(null));
+
+// prepareTrack / brightness / sectionEnergy
+const raw = {
+    segments: segs.map((sg, i) => ({ ...sg, timbre: [50, i * 10 - 100, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] })),
+    beats, bars: [{ start: 0.25 }, { start: 4.25 }],
+    sections: [{ start: 0, loudness: -14 }, { start: 4, loudness: -6 }, { start: 8, loudness: -10 }],
+    track: { duration: 10, tempo: 128 },
+};
+const tr = prepareTrack(raw);
+check('prepare: null without segments', prepareTrack({}) === null && prepareTrack({ segments: [] }) === null && prepareTrack(null) === null);
+check('prepare: keeps lists', tr.segments.length === 20 && tr.beats.length === 10 && tr.bars.length === 2 && tr.sections.length === 3);
+check('prepare: duration, tempo', tr.duration === 10 && tr.tempo === 128);
+check('prepare: loudness range', tr.loudMin === -14 && tr.loudMax === -6);
+const bare = prepareTrack({ segments: segs });
+check('prepare: defaults when parts missing', bare.beats.length === 0 && bare.bars.length === 0 && bare.tempo === 120 && near(bare.duration, 10));
+check('spread never 0', spread([3, 3, 3]).sd === 1 && near(spread([1, 3]).mean, 2));
+check('brightness low/high', brightness(tr, raw.segments[0]) < 0.2 && brightness(tr, raw.segments[19]) > 0.8);
+check('brightness middle ~0.5', Math.abs(brightness(tr, { timbre: [0, tr.bright.mean] }) - 0.5) < 1e-9);
+check('brightness without timbre', near(brightness(bare, segs[0]), 0.5));
+check('energy quietest/loudest', sectionEnergy(tr, raw.sections[0]) === 0 && sectionEnergy(tr, raw.sections[1]) === 1);
+check('energy middle', near(sectionEnergy(tr, raw.sections[2]), 0.5));
+check('energy no section / flat track', sectionEnergy(tr, undefined) === 0.6 && sectionEnergy(bare, { loudness: -9 }) === 0.6);
+
+// colours
+const same = (a, b) => a && b && a.length === 3 && a.every((v, i) => Math.abs(v - b[i]) <= 1);
+check('parse #rgb', same(parseColour('#1d5'), [17, 221, 85]));
+check('parse #rrggbb', same(parseColour(' #1ed760 '), [30, 215, 96]));
+check('parse rgb()', same(parseColour('rgb(10, 20, 30)'), [10, 20, 30]) && same(parseColour('rgba(10,20,30,0.5)'), [10, 20, 30]));
+check('parse ARGB hex', same(parseColour('#ff1ed760'), [30, 215, 96]));
+check('parse negative ARGB', same(parseColour('#-e128a0'), [30, 215, 96]));
+check('parse junk', parseColour('') === null && parseColour('red') === null && parseColour(undefined) === null);
+let round = true;
+for (const c of [[30, 215, 96], [255, 0, 0], [12, 34, 200], [128, 128, 128], [0, 0, 0], [255, 255, 255]]) {
+    if (!same(hslToRgb(rgbToHsl(c)), c)) round = false;
+}
+check('hsl round trip', round);
+check('hue shift wraps negative', same(hslToRgb([-120, 1, 0.5]), [0, 0, 255]));
+check('lift dark colour', rgbToHsl(adjustColour([20, 10, 40], { minL: 0.5 }))[2] >= 0.49);
+check('lift leaves light colour', same(adjustColour([200, 220, 240], { minL: 0.5 }), [200, 220, 240]));
+const tp = themePalette('#1ed760', '#ffffff');
+check('theme palette', same(tp.a, [30, 215, 96]) && tp.b && tp.c && tp.c[0] > tp.a[0]);
+check('theme palette fallback', same(themePalette('', '').a, [30, 215, 96]));
+const ap = albumPalette({ VIBRANT: '#c02010', DARK_VIBRANT: '#300808', LIGHT_VIBRANT: '#f0c0b0' });
+check('album palette lifted', ap && rgbToHsl(ap.a)[2] >= 0.49 && rgbToHsl(ap.b)[2] >= 0.41 && rgbToHsl(ap.c)[2] >= 0.61);
+check('album palette prefers non-alarming', same(albumPalette({ VIBRANT: '#ff0000', VIBRANT_NON_ALARMING: '#2080c0' }).a, adjustColour([32, 128, 192], { minL: 0.5 })));
+check('album palette missing', albumPalette(null) === null && albumPalette({ DARK_VIBRANT: '#101010' }) === null);
+check('album palette only vibrant', !!albumPalette({ VIBRANT: '#2080c0' })?.b);
 
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
