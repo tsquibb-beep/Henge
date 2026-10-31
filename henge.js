@@ -1492,12 +1492,16 @@ html.henge-on.henge-resizing .henge-handle {
         const cache = new Map();            // uri → prepared track (or null), the last few
         const swatchCache = new Map();      // uri → album colour swatches (or null)
         let uri = null, track = null, state = 'idle', error = null, token = 0;
-        let swatches = null, swatchSource = null, swatchError = null, cover = null, coverReady = false;
+        let swatches = null, swatchSource = null, swatchError = null;
         let raf = 0, lastFrame = 0, lastDrawnT = -1, scale = 1, wipe = true;
         // Animated values, eased every frame. kick: the last segment's hit;
         // heat: how intense things are overall, which most effects follow.
         let level = 0, edge = 0.5, energy = 0.6, bloom = 0, downbeat = 0, pulse = 0, kick = 0, heat = 0;
-        let phase = 0, spin = 0, clock = 0, intro = 0;
+        let phase = 0, clock = 0, intro = 0;
+        // whiteout: a split-second white flash on the biggest moments, never
+        // more often than WHITEOUT_GAP seconds.
+        const WHITEOUT_GAP = 5;
+        let whiteout = 0, lastWhiteout = -Infinity, whiteouts = 0;
         let segIdx = -1, beatIdx = -1, barIdx = -1, secIdx = -1;
         let pitches = new Array(12).fill(0);
         let palette = null, goal = null;    // { a, b, c } as [r, g, b]; palette fades to goal
@@ -1557,15 +1561,10 @@ html.henge-on.henge-resizing .henge-handle {
                 `https://spclient.wg.spotify.com/audio-attributes/v1/audio-analysis/${u.split(':')[2]}?format=json`);
         }
 
-        // The cover's spotify:image: URI, and its https URL.
+        // The cover's spotify:image: URI, which album colours are keyed by.
         function coverUri() {
             const m = Spicetify.Player?.data?.item?.metadata ?? {};
             return m.image_xlarge_url || m.image_large_url || m.image_url || '';
-        }
-        function coverUrl() {
-            const u = coverUri();
-            if (u.startsWith('spotify:image:')) return `https://i.scdn.co/image/${u.slice(14)}`;
-            return u.startsWith('https:') ? u : null;
         }
 
         // Album colours: Spotify's own extraction (the GraphQL query its
@@ -1608,20 +1607,6 @@ html.henge-on.henge-resizing .henge-handle {
             });
         }
 
-        // Decoded off the main thread before first use, so drawing it
-        // doesn't stall a frame.
-        function loadCover() {
-            const url = coverUrl();
-            if (cover?.src === url) return;
-            cover = null;
-            coverReady = false;
-            if (!url) return;
-            const img = new Image();
-            img.src = url;
-            cover = img;
-            img.decode().then(() => { if (cover === img) { coverReady = true; wake(); } }, () => {});
-        }
-
         // Loads the current track's analysis; a later call wins over a slow one.
         async function load() {
             const mine = ++token;
@@ -1629,7 +1614,6 @@ html.henge-on.henge-resizing .henge-handle {
             track = null;
             segIdx = beatIdx = barIdx = secIdx = -1;
             wipe = true;
-            loadCover();
             loadSwatches(mine);
             if (!uri) return showState('idle');
             if (!isTrackUri(uri)) return showState('nodata');
@@ -1732,6 +1716,36 @@ html.henge-on.henge-resizing .henge-handle {
             ctx.globalCompositeOperation = 'source-over';
         }
 
+        // Inside a wave's body (clipped to it): drifting plasma, ripples
+        // running out from the middle to the edge, and a hot core. `ripple`
+        // draws the body's outline scaled by f (0 = the middle, 1 = the edge).
+        function interior({ body, ripple, core, cx, cy, w, h }) {
+            ctx.save();
+            body();
+            ctx.clip('evenodd');
+            ctx.globalCompositeOperation = 'lighter';
+            for (let i = 0; i < 4; i++) {
+                const bx = cx + (noise2(i * 7.3, clock * 0.35) - 0.5) * w * 1.1;
+                const by = cy + (noise2(i * 3.1 + 50, clock * 0.5) - 0.5) * h * 0.6;
+                const br = (0.3 + 0.25 * noise2(i + 20, clock * 0.8)) * Math.max(w, h) * 0.5 * (0.5 + 0.7 * level);
+                const g = ctx.createRadialGradient(bx, by, 0, bx, by, br);
+                g.addColorStop(0, rgba(i % 2 ? palette.b : palette.c, 0.2 + 0.25 * kick + 0.1 * energy));
+                g.addColorStop(1, rgba(palette.b, 0));
+                ctx.fillStyle = g;
+                ctx.fillRect(bx - br, by - br, 2 * br, 2 * br);
+            }
+            const hot = mixRgb(palette.a, [255, 255, 255], 0.55);
+            for (let k = 0; k < 6; k++) {
+                const f = (k / 6 + clock * (0.3 + 0.7 * level)) % 1;
+                ripple(f);
+                ctx.strokeStyle = rgba(hot, 4 * f * (1 - f) * (0.1 + 0.4 * downbeat + 0.3 * kick + 0.1 * energy));
+                ctx.lineWidth = (1 + 2.5 * downbeat) * scale;
+                ctx.stroke();
+            }
+            core(hot);
+            ctx.restore();
+        }
+
         // Each wave style draws itself and returns its geometry for the
         // effects: where sparks leave from (crest), how they're pulled
         // (accel), the shape of a shockwave, and a size to scale speeds by.
@@ -1758,11 +1772,30 @@ html.henge-on.henge-resizing .henge-handle {
                     continue;
                 }
                 const g = ctx.createLinearGradient(0, mid - max, 0, mid + max);
-                g.addColorStop(0, rgba(layer.colour, 0.03));
-                g.addColorStop(0.5, rgba(layer.colour, 0.45 + 0.25 * downbeat + 0.2 * kick));
-                g.addColorStop(1, rgba(layer.colour, 0.03));
+                g.addColorStop(0, rgba(layer.colour, 0.04));
+                g.addColorStop(0.5, rgba(layer.colour, 0.3 + 0.15 * downbeat));
+                g.addColorStop(1, rgba(layer.colour, 0.04));
                 ctx.fillStyle = g;
                 ctx.fill();
+                interior({
+                    body: outline, cx: W / 2, cy: mid, w: W, h: H,
+                    ripple: f => {
+                        ctx.beginPath();
+                        for (let i = 0; i <= n; i++) ctx.lineTo(i / n * W, mid - amps[i] * max * f);
+                        for (let i = n; i >= 0; i--) ctx.lineTo(i / n * W, mid + amps[i] * max * f);
+                        ctx.closePath();
+                    },
+                    // A white-hot band along the middle, swelling on hits.
+                    core: hot => {
+                        const half = max * (0.06 + 0.22 * level + 0.3 * kick + 0.15 * bloom);
+                        const band = ctx.createLinearGradient(0, mid - half, 0, mid + half);
+                        band.addColorStop(0, rgba(hot, 0));
+                        band.addColorStop(0.5, rgba([255, 255, 255], 0.2 + 0.45 * kick + 0.25 * downbeat));
+                        band.addColorStop(1, rgba(hot, 0));
+                        ctx.fillStyle = band;
+                        ctx.fillRect(0, mid - half, W, 2 * half);
+                    },
+                });
                 glowStroke(layer.colour);
                 split(outline, layer.colour);
                 front = amps;
@@ -1787,30 +1820,29 @@ html.henge-on.henge-resizing .henge-handle {
             };
         }
 
-        // The wave wrapped into a ring around the album cover, which turns
-        // slowly while the song plays.
+        // The wave wrapped into a ring around a glowing core, with ripples
+        // expanding out of it.
         function drawRadial(W, H) {
             const cx = W / 2, cy = H / 2, m = Math.min(W, H);
             const R = m * 0.27, span = m * 0.2, n = 220;
-            const r = R * 0.8 * (1 + 0.035 * downbeat + 0.05 * kick);
-            ctx.save();
-            ctx.beginPath();
-            ctx.arc(cx, cy, r, 0, 2 * Math.PI);
-            ctx.clip();
-            if (coverReady) {
-                ctx.translate(cx, cy);
-                ctx.rotate(spin);
-                ctx.drawImage(cover, -r, -r, 2 * r, 2 * r);
-            } else {
-                ctx.fillStyle = rgba(palette.b, 0.3);
-                ctx.fillRect(cx - r, cy - r, 2 * r, 2 * r);
+            const r = R * 0.75 * (1 + 0.06 * downbeat + 0.08 * kick);
+            const hot = mixRgb(palette.a, [255, 255, 255], 0.55);
+            ctx.globalCompositeOperation = 'lighter';
+            const orb = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+            orb.addColorStop(0, rgba([255, 255, 255], 0.15 + 0.4 * kick + 0.2 * bloom));
+            orb.addColorStop(0.35, rgba(palette.c, 0.18 + 0.2 * level + 0.15 * downbeat));
+            orb.addColorStop(1, rgba(palette.a, 0));
+            ctx.fillStyle = orb;
+            ctx.fillRect(cx - r, cy - r, 2 * r, 2 * r);
+            for (let k = 0; k < 5; k++) {
+                const f = (k / 5 + clock * (0.25 + 0.6 * level)) % 1;
+                ctx.beginPath();
+                ctx.arc(cx, cy, Math.max(1, f * r), 0, 2 * Math.PI);
+                ctx.strokeStyle = rgba(hot, 4 * f * (1 - f) * (0.08 + 0.35 * downbeat + 0.25 * kick));
+                ctx.lineWidth = (1 + 2 * downbeat) * scale;
+                ctx.stroke();
             }
-            ctx.restore();
-            ctx.strokeStyle = rgba(palette.c, 0.3 + 0.4 * downbeat);
-            ctx.lineWidth = 1.5 * scale;
-            ctx.beginPath();
-            ctx.arc(cx, cy, r + 2 * scale, 0, 2 * Math.PI);
-            ctx.stroke();
+            ctx.globalCompositeOperation = 'source-over';
 
             const point = (i, rad) => {
                 const th = i / n * 2 * Math.PI - Math.PI / 2;
@@ -1835,11 +1867,28 @@ html.henge-on.henge-resizing .henge-handle {
                     continue;
                 }
                 const g = ctx.createRadialGradient(cx, cy, R - span * 0.25, cx, cy, R + span);
-                g.addColorStop(0, rgba(layer.colour, 0.3));
-                g.addColorStop(0.2, rgba(layer.colour, 0.5 + 0.25 * downbeat + 0.2 * kick));
+                g.addColorStop(0, rgba(layer.colour, 0.25));
+                g.addColorStop(0.2, rgba(layer.colour, 0.35 + 0.15 * downbeat));
                 g.addColorStop(1, rgba(layer.colour, 0.03));
                 ctx.fillStyle = g;
                 ctx.fill('evenodd');
+                const body = () => {
+                    ctx.beginPath();
+                    ring(amps, a => R + a * span);
+                    ring(amps, a => R - a * span * 0.25);
+                };
+                interior({
+                    body, cx, cy, w: 2 * (R + span), h: 2 * (R + span),
+                    ripple: f => { ctx.beginPath(); ring(amps, a => R + a * span * f); },
+                    // A white-hot line round the ring's base.
+                    core: hotCore => {
+                        ctx.beginPath();
+                        ctx.arc(cx, cy, R, 0, 2 * Math.PI);
+                        ctx.strokeStyle = rgba(hotCore, 0.25 + 0.5 * kick + 0.25 * downbeat);
+                        ctx.lineWidth = (2 + 6 * level + 6 * kick) * scale;
+                        ctx.stroke();
+                    },
+                });
                 const outer = () => { ctx.beginPath(); ring(amps, a => R + a * span); };
                 outer();
                 glowStroke(layer.colour);
@@ -1952,6 +2001,11 @@ html.henge-on.henge-resizing .henge-handle {
                 if (heat > 0.35) shocks.push({ age: 0, power: heat });
                 if (heat > 0.6 && Math.random() < heat) bolt(geo);
             }
+            if (ev.whiteout) {
+                count += 260;
+                shocks.push({ age: 0, power: 2 });
+                for (let i = 0; i < 5; i++) bolt(geo);
+            }
             if (ev.section) {
                 count += 220;
                 shocks.push({ age: 0, power: 1.4 });
@@ -2051,6 +2105,10 @@ html.henge-on.henge-resizing .henge-handle {
         function drawFx(on) {
             const W = fx.width, H = fx.height;
             fxCtx.clearRect(0, 0, W, H);
+            if (whiteout > 0.01 && W && H) {
+                fxCtx.fillStyle = `rgba(255, 255, 255, ${0.92 * whiteout})`;
+                fxCtx.fillRect(0, 0, W, H);
+            }
             if (!on || state !== 'ready' || style === 'scroll' || !W || !H) return;
             const flash = 0.09 * downbeat * heat + 0.25 * bloom + 0.06 * kick;
             if (flash > 0.01) {
@@ -2078,9 +2136,9 @@ html.henge-on.henge-resizing .henge-handle {
             const dt = lastFrame ? Math.min(0.05, (now - lastFrame) / 1000) : 0;
             lastFrame = now;
             const t = progress(), on = playing();
-            let levelTo = 0, beat = 0, bar = 0, edgeTo = edge, energyTo = energy;
+            let levelTo = 0, beat = 0, bar = 0, edgeTo = edge, energyTo = energy, peak = 0;
             // Events only fire as playback moves on, not when seeking.
-            const ev = { kick: 0, downbeat: false, section: false };
+            const ev = { kick: 0, downbeat: false, section: false, whiteout: false };
             if (state === 'ready' && on) {
                 const segs = track.segments;
                 const prevSeg = segIdx;
@@ -2091,7 +2149,10 @@ html.henge-on.henge-resizing .henge-handle {
                     const p = pitchesAt(seg, next, t);
                     pitches = pitches.map((v, i) => ease(v, p[i], dt, 0.08));
                     edgeTo = brightness(track, seg);
-                    if (segIdx === prevSeg + 1) ev.kick = attackOf(seg);
+                    if (segIdx === prevSeg + 1) {
+                        ev.kick = attackOf(seg);
+                        peak = dbToLevel(seg.loudness_max);
+                    }
                 }
                 beatIdx = indexAt(track.beats, t, beatIdx);
                 beat = beatPulse(track.beats[beatIdx], t);
@@ -2103,7 +2164,16 @@ html.henge-on.henge-resizing .henge-handle {
                 secIdx = indexAt(track.sections, t, secIdx);
                 energyTo = sectionEnergy(track, track.sections[secIdx]);
                 ev.section = secIdx > 0 && secIdx === prevSec + 1;
-                spin += dt * 2 * Math.PI * 0.1 * (track.tempo / 120) + ev.kick * 0.04;
+                // The biggest moments white out: a very hard, very loud hit
+                // in an intense stretch, or a new section near the loudest.
+                const bigHit = ev.kick >= 0.75 && peak > 0.75 && heat > 0.7;
+                const bigSection = ev.section && energyTo > 0.8;
+                if ((bigHit || bigSection) && style !== 'scroll' && clock - lastWhiteout > WHITEOUT_GAP) {
+                    ev.whiteout = true;
+                    whiteout = 1;
+                    lastWhiteout = clock;
+                    whiteouts++;
+                }
             }
             level = ease(level, levelTo, dt, 0.05);
             edge = ease(edge, edgeTo, dt, 0.2);
@@ -2113,6 +2183,7 @@ html.henge-on.henge-resizing .henge-handle {
             kick = Math.max(kick * Math.exp(-dt / 0.09), ev.kick);
             if (ev.section) bloom = 1;
             bloom *= Math.exp(-dt / 0.9);
+            whiteout *= Math.exp(-dt / 0.07);
             intro = state === 'ready' ? Math.min(1, intro + dt / 0.6) : 0;
             heat = clamp01(0.45 * level + 0.55 * energy + 0.3 * bloom);
             clock += dt;
@@ -2137,7 +2208,7 @@ html.henge-on.henge-resizing .henge-handle {
                         drawScroll(W, H, t);
                     } else {
                         // A shake on downbeats, harder when it's loud.
-                        const shake = (4 * downbeat * heat + 3 * kick * heat) * scale;
+                        const shake = (4 * downbeat * heat + 3 * kick * heat + 12 * whiteout) * scale;
                         ctx.save();
                         ctx.translate((noise2(clock * 40, 1) - 0.5) * 2 * shake, (noise2(clock * 40, 9) - 0.5) * 2 * shake);
                         const geo = style === 'radial' ? drawRadial(W, H) : style === 'line' ? drawLine(W, H) : drawMirror(W, H);
@@ -2152,7 +2223,7 @@ html.henge-on.henge-resizing .henge-handle {
             // Paused (or nothing to show): stop once everything has settled.
             // Housekeeping restarts it if anything changes.
             const fading = palette && goal && ['a', 'b', 'c'].some(k => palette[k].some((v, i) => Math.abs(v - goal[k][i]) > 0.5));
-            const still = style === 'scroll' || (level < 0.002 && kick < 0.01 && bloom < 0.01
+            const still = style === 'scroll' || (level < 0.002 && kick < 0.01 && bloom < 0.01 && whiteout < 0.01
                 && !particles.length && !shocks.length && !bolts.length);
             if ((on || !still || fading) && state === 'ready' && W && H) raf = requestAnimationFrame(frame);
             else lastFrame = 0;
@@ -2205,7 +2276,7 @@ html.henge-on.henge-resizing .henge-handle {
             msg.remove();
             content = canvas = ctx = fx = fxCtx = msg = resizeObs = housekeeping = grain = null;
             token++;
-            level = bloom = kick = intro = 0;
+            level = bloom = kick = intro = whiteout = 0;
             particles = []; shocks = []; bolts = [];
         }
 
@@ -2237,7 +2308,7 @@ html.henge-on.henge-resizing .henge-handle {
             palette: palette && { a: hex(palette.a), b: hex(palette.b), c: hex(palette.c) },
             energy: +energy.toFixed(2), edge: +edge.toFixed(2), heat: +heat.toFixed(2),
             particles: particles.length, shocks: shocks.length, bolts: bolts.length,
-            cover: cover?.src ?? null, coverReady, cached: cache.size,
+            whiteouts, cached: cache.size,
         });
 
         return {
