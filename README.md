@@ -3,7 +3,7 @@
 A [Spicetify](https://spicetify.app/) extension that stacks Spotify's desktop layout
 for tall screens. The main view spans the full width of the window. Two panels sit
 underneath it, side by side, and you choose what goes where: your Library, Now
-Playing, the Queue, Lyrics and more.
+Playing, the Queue, Lyrics, a visualiser and more.
 
 ```
 ┌──────────────── global nav ────────────────┐
@@ -72,6 +72,10 @@ panels (top, bottom left, bottom right), each with a dropdown:
   own. These are live copies of Spotify's own panels, with the same menus, drag and drop
   and updates, so you can have Now Playing and the Queue side by side, or lyrics
   alongside a playlist.
+- **Visualiser:** a wave that moves with the song, drawn from Spotify's track analysis.
+  When it's placed, the map has two more dropdowns: the style (Mirrored wave, Radial,
+  Line or Scrolling waveform) and the colours (your theme's, or the album art's). Local
+  files and podcasts have no analysis, so it shows a message instead.
 - **Nothing:** the neighbouring panel takes the space.
 
 Picking something that's already in another panel swaps the two. Your layout is
@@ -100,7 +104,7 @@ layout change would do the same, Henge puts the previous layout back.
 
 Henge is an extension, not a theme, so it works on top of your existing theme.
 
-- **Tested on:** Spotify 1.3.3 with Spicetify 2.45.3, on Windows.
+- **Tested on:** Spotify 1.3.6 with Spicetify 2.46.4, on Windows.
 - **Works alongside:** the Sleek theme, and the "Made For You" shortcut, Shuffle+ and
   Collapsing Library extensions.
 - **Lyrics extensions:** the pinned Lyrics panel borrows Spotify's own lyrics page, so it
