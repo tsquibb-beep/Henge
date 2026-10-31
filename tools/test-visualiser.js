@@ -8,9 +8,9 @@ const src = fs.readFileSync(require('path').join(__dirname, '..', 'henge.js'), '
 const start = src.indexOf('    // ── Visualiser maths');
 const end = src.indexOf('    // ── Visualiser view');
 if (start < 0 || end < start) throw new Error('visualiser markers not found in henge.js');
-const code = `${src.slice(start, end)}\nmodule.exports={indexAt, loudnessAt, dbToLevel, beatPulse, pitchesAt, catmull, chromaAt, ease, isTrackUri, VIS_DB_FLOOR, spread, prepareTrack, brightness, sectionEnergy, parseColour, rgbToHsl, hslToRgb, adjustColour, themePalette, albumPalette, hash2, noise2, attackOf, swatchesFromExtracted};`;
+const code = `${src.slice(start, end)}\nmodule.exports={indexAt, loudnessAt, dbToLevel, beatPulse, pitchesAt, catmull, chromaAt, ease, isTrackUri, VIS_DB_FLOOR, spread, prepareTrack, brightness, sectionEnergy, parseColour, rgbToHsl, hslToRgb, adjustColour, themePalette, albumPalette, hash2, noise2, attackOf, swatchesFromExtracted, swatchesFromPixels};`;
 const m = {}; new Function('module', code)(m);
-const { indexAt, loudnessAt, dbToLevel, beatPulse, pitchesAt, catmull, chromaAt, ease, isTrackUri, VIS_DB_FLOOR, spread, prepareTrack, brightness, sectionEnergy, parseColour, rgbToHsl, hslToRgb, adjustColour, themePalette, albumPalette, hash2, noise2, attackOf, swatchesFromExtracted } = m.exports;
+const { indexAt, loudnessAt, dbToLevel, beatPulse, pitchesAt, catmull, chromaAt, ease, isTrackUri, VIS_DB_FLOOR, spread, prepareTrack, brightness, sectionEnergy, parseColour, rgbToHsl, hslToRgb, adjustColour, themePalette, albumPalette, hash2, noise2, attackOf, swatchesFromExtracted, swatchesFromPixels } = m.exports;
 
 let pass = 0, fail = 0;
 const near = (a, b, eps = 1e-6) => Math.abs(a - b) <= eps;
@@ -173,6 +173,23 @@ check('extracted -> swatches', sw && sw.VIBRANT === '#C02010' && sw.DARK_VIBRANT
 check('extracted -> album palette', !!albumPalette(sw));
 check('extracted all fallback -> null', swatchesFromExtracted({ ...ex, colorRaw: { hex: '#535353', isFallback: true }, colorDark: { hex: '#000', isFallback: true }, colorLight: { hex: '#fff', isFallback: true } }) === null);
 check('extracted wrong type / missing', swatchesFromExtracted({ __typename: 'NotFound' }) === null && swatchesFromExtracted(null) === null);
+
+// swatchesFromPixels (cover fallback)
+const image = (fn, n = 32 * 32) => { const d = new Uint8ClampedArray(n * 4); for (let i = 0; i < n; i++) { const [r, g, b, a = 255] = fn(i, n); d.set([r, g, b, a], i * 4); } return d; };
+const isGrey = h => { const c = parseColour(h); return c && c[0] === c[1] && c[1] === c[2]; };
+const greyImg = image((i, n) => { const v = Math.round(i / n * 255); return [v, v, v]; });
+const gs = swatchesFromPixels(greyImg);
+check('greyscale -> greys', gs && isGrey(gs.VIBRANT) && isGrey(gs.DARK_VIBRANT) && isGrey(gs.LIGHT_VIBRANT));
+check('greyscale tones ordered', parseColour(gs.DARK_VIBRANT)[0] < parseColour(gs.VIBRANT)[0] && parseColour(gs.VIBRANT)[0] < parseColour(gs.LIGHT_VIBRANT)[0]);
+const gp = albumPalette(gs);
+check('greyscale palette stays grey', gp && [gp.a, gp.b, gp.c].every(c => Math.abs(c[0] - c[1]) <= 1 && Math.abs(c[1] - c[2]) <= 1));
+check('near-grey noise counts as greyscale', isGrey(swatchesFromPixels(image(i => [100 + (i % 7), 100, 102 + (i % 3)])).VIBRANT));
+const red = swatchesFromPixels(image(i => (i % 4 ? [200, 30, 40] : [20, 20, 20])));
+check('colourful -> its hue', (() => { const [h, s2] = rgbToHsl(parseColour(red.VIBRANT)); return (h < 15 || h > 345) && s2 > 0.5; })());
+check('colourful dark/light shades', rgbToHsl(parseColour(red.DARK_VIBRANT))[2] < rgbToHsl(parseColour(red.VIBRANT))[2] && rgbToHsl(parseColour(red.LIGHT_VIBRANT))[2] >= 0.79);
+const mixed = swatchesFromPixels(image(i => (i % 3 ? [30, 90, 200] : [220, 200, 40])));
+check('dominant hue wins', rgbToHsl(parseColour(mixed.VIBRANT))[0] > 200 && rgbToHsl(parseColour(mixed.VIBRANT))[0] < 230);
+check('transparent / empty -> null', swatchesFromPixels(image(() => [0, 0, 0, 0])) === null && swatchesFromPixels(new Uint8ClampedArray(0)) === null);
 
 console.log(`${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

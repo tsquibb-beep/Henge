@@ -1475,6 +1475,43 @@ html.henge-on.henge-resizing .henge-handle {
         return { VIBRANT: e.colorRaw?.hex, DARK_VIBRANT: e.colorDark?.hex, LIGHT_VIBRANT: e.colorLight?.hex };
     }
 
+    const toHex = c => `#${c.map(v => Math.round(v).toString(16).padStart(2, '0')).join('')}`;
+
+    // Swatches from raw RGBA pixels, for when Spotify's extraction falls
+    // back. Greyscale art (Spotify finds no vibrant colour in it) gives greys
+    // from its own dark, mid and light tones; anything else, the strongest
+    // of 12 hue bands.
+    function swatchesFromPixels(data) {
+        const px = [];
+        for (let i = 0; i + 3 < data.length; i += 4) {
+            if (data[i + 3] < 128) continue;
+            const rgb = [data[i], data[i + 1], data[i + 2]];
+            px.push({ rgb, hsl: rgbToHsl(rgb), chroma: (Math.max(...rgb) - Math.min(...rgb)) / 255 });
+        }
+        if (!px.length) return null;
+        const bands = Array.from({ length: 12 }, () => ({ w: 0, sum: [0, 0, 0] }));
+        for (const p of px) {
+            if (p.chroma < 0.15) continue;
+            const band = bands[Math.floor(p.hsl[0] / 30) % 12];
+            band.w += p.chroma;
+            band.sum = band.sum.map((v, i) => v + p.rgb[i] * p.chroma);
+        }
+        const best = bands.reduce((a, b) => (b.w > a.w ? b : a));
+        const colourful = px.reduce((s, p) => s + p.chroma, 0) / px.length >= 0.08 && best.w > 0;
+        if (!colourful) {
+            const ls = px.map(p => p.hsl[2]).sort((a, b) => a - b);
+            const grey = q => { const v = ls[Math.min(ls.length - 1, Math.floor(q * ls.length))] * 255; return toHex([v, v, v]); };
+            return { VIBRANT: grey(0.6), DARK_VIBRANT: grey(0.2), LIGHT_VIBRANT: grey(0.95) };
+        }
+        const main = best.sum.map(v => v / best.w);
+        const [h, sat, l] = rgbToHsl(main);
+        return {
+            VIBRANT: toHex(main),
+            DARK_VIBRANT: toHex(hslToRgb([h, sat, l * 0.5])),
+            LIGHT_VIBRANT: toHex(hslToRgb([h, sat * 0.6, Math.max(l, 0.8)])),
+        };
+    }
+
     // ── Visualiser view ──
 
     const visualiser = (() => {
@@ -1567,8 +1604,34 @@ html.henge-on.henge-resizing .henge-handle {
             return m.image_xlarge_url || m.image_large_url || m.image_url || '';
         }
 
+        // Colours from the cover's own pixels, read from a 32px copy
+        // (i.scdn.co allows cross-origin reads).
+        function sampleCover(image) {
+            const url = image.startsWith('spotify:image:') ? `https://i.scdn.co/image/${image.slice(14)}` : null;
+            if (!url) return Promise.resolve(null);
+            return new Promise(resolve => {
+                const img = new Image();
+                img.crossOrigin = 'anonymous';
+                img.onload = () => {
+                    try {
+                        const c = document.createElement('canvas');
+                        c.width = c.height = 32;
+                        const cctx = c.getContext('2d', { willReadFrequently: true });
+                        cctx.drawImage(img, 0, 0, 32, 32);
+                        resolve(swatchesFromPixels(cctx.getImageData(0, 0, 32, 32).data));
+                    } catch (e) {
+                        swatchError = `cover pixels: ${e?.message ?? e}`;
+                        resolve(null);
+                    }
+                };
+                img.onerror = () => { swatchError = 'cover pixels: image failed to load'; resolve(null); };
+                img.src = url;
+            });
+        }
+
         // Album colours: Spotify's own extraction (the GraphQL query its
-        // Now Playing view uses), else Spicetify's older colorExtractor.
+        // Now Playing view uses), else the cover's pixels (Spotify falls
+        // back on greyscale art), else Spicetify's older colorExtractor.
         async function fetchSwatches(u, image) {
             const G = Spicetify.GraphQL, def = G?.Definitions?.fetchExtractedColors;
             swatchError = null;
@@ -1579,6 +1642,8 @@ html.henge-on.henge-resizing .henge-handle {
                     if (sw) { swatchSource = 'fetchExtractedColors'; return sw; }
                 } catch (e) { swatchError = `fetchExtractedColors: ${e?.message ?? e}`; }
             }
+            const sampled = await sampleCover(image);
+            if (albumPalette(sampled)) { swatchSource = 'cover pixels'; return sampled; }
             if (Spicetify.colorExtractor) {
                 try {
                     const sw = await Spicetify.colorExtractor(u);
@@ -2296,7 +2361,7 @@ html.henge-on.henge-resizing .henge-handle {
             loadSwatches(token);
         }
 
-        const hex = c => c && `#${c.map(v => Math.round(v).toString(16).padStart(2, '0')).join('')}`;
+        const hex = c => c && toHex(c);
         const info = () => ({
             mounted: !!canvas, style, colours: colourMode, state, error, uri,
             segments: track?.segments.length ?? null,
